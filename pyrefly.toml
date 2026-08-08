@@ -1,0 +1,18 @@
+# Configuracion del analizador estatico pyrefly (el que usa VSCode).
+#
+# Sin esto, pyrefly busca los paquetes en el Python del sistema
+# (C:\msys64\mingw64\...) y marca como no encontrados cv2, flet, pyttsx3,
+# numpy, etc., aunque esten correctamente instalados en el entorno virtual.
+
+# Interprete del proyecto: de aqui se leen los site-packages.
+python-interpreter = "venv/Scripts/python.exe"
+
+# Los imports internos son de la forma 'app.*', asi que la raiz de busqueda
+# es la carpeta padre de esta.
+search-path = [".."]
+
+project-includes = ["**/*.py"]
+project-excludes = [
+    "venv/**",
+    "**/__pycache__/**",
+]

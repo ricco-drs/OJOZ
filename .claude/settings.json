@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/Scripts/python.exe -c ' *)",
+      "Bash(timeout 40 ./app/venv/Scripts/python.exe -u -m app.main_flet)",
+      "Bash(nohup ./app/venv/Scripts/python.exe -u -m app.main_flet)",
+      "Bash(echo \"lanzada, pid $!\")",
+      "Bash(./venv/Scripts/python.exe -m pip install pyrefly -q)"
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"c:/Users/Asus/Desktop/Proyectos/sgbd\")",
+      "Read(//c/Users/Asus/Desktop/Proyectos/sgbd/**)",
+      "Bash(./venv/Scripts/python.exe -m pip freeze)",
+      "PowerShell($p=\"c:\\\\Users\\\\Asus\\\\Desktop\\\\Proyectos\\\\app\\\\ui\\\\flet_app.py\"; $t=[IO.File]::ReadAllText\\($p\\); $t=$t.Replace\\(\"seg\"+[char]0xFFFD+\"n\",\"según\"\\).Replace\\(\"m\"+[char]0xFFFD+\"todo\",\"método\"\\); [IO.File]::WriteAllText\\($p,$t,\\(New-Object Text.UTF8Encoding $false\\)\\); \\([regex]::Matches\\($t,[char]0xFFFD\\)\\).Count)"
+    ]
+  }
+}

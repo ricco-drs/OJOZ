@@ -1,0 +1,16 @@
+{
+  // Interprete del proyecto. Sin esto, el analizador de VSCode busca los
+  // paquetes en la instalacion de Python del sistema (msys64) y marca en rojo
+  // cv2, flet, pyttsx3, etc., aunque esten instalados en el entorno virtual.
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true,
+
+  // Los imports del proyecto son 'app.*', por lo que la raiz de resolucion
+  // es la carpeta padre de esta.
+  "python.analysis.extraPaths": ["${workspaceFolder}/.."],
+  "python.analysis.autoSearchPaths": true,
+
+  "files.exclude": {
+    "**/__pycache__": true
+  }
+}

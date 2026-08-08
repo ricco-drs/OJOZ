@@ -1,0 +1,1124 @@
+from __future__ import annotations
+import re
+import threading
+import time
+from typing import Literal
+
+from app.core.event_bus import event_bus
+from app.audio.tts import TTS
+from app.audio.stt import STT
+from app.config.settings import config  # (tu import original, lo mantengo)
+# ===== NUEVOS IMPORTS =====
+from app.config.settings import vision  # rutas/umbrales de visión
+from app.vision.face_capture import capture_faces
+from app.vision.face_train import train_dataset
+from app.vision.face_recognition import recognize_best_frame
+from app.utils.fs import user_folder as get_user_folder
+# ==== IMPORTS DE BASE DE DATOS ====
+from app.db import dao
+# ==========================
+# === OCR (Opción 1) ===
+from app.vision.ocr import read_text_best_frame
+# === CURRENCY (Opción 2) ===
+from app.vision.currency import detect_currency_best_frame
+# === EXPIRY (Opción 3) ===
+from app.vision.expiry import check_expiry_best_frame
+
+from app.core.router import infer_intent
+
+State = Literal["IDLE", "TTS_SPEAKING", "LISTENING", "PROCESSING"]
+
+# Nombre hablado de cada divisa que puede detectar vision/currency.py
+_CURR_TO_UNIT = {"PEN": "soles", "USD": "dólares"}
+
+class Controller:
+    """
+    Orquestador de turnos TTS/STT con máquina de estados.
+    - Usa eventos "tts:start"/"tts:end" para gatear el micrófono.
+    - Incluye un WATCHDOG que reactiva STT si "tts:end" no llega.
+    """
+
+    def __init__(self, tts: TTS, stt: STT):
+        self.tts = tts
+        self.stt = stt
+        self.state: State = "IDLE"
+        self._lock = threading.RLock()
+        self._fallback_timer: threading.Timer | None = None
+        
+        # Estado del flujo de conversación
+        self._conversation_state: str | None = None  # "waiting_new_user_name", "waiting_returning_user_name", etc.
+        self._user_name: str | None = None
+        self._authenticated: bool = False  # Flag para saber si el usuario está autenticado
+
+        # ===== NUEVOS FLAGS =====
+        self._pending_enroll_after_tts: bool = False   # dispara captura tras tts:end
+        self._pending_auth_after_tts: bool = False     # dispara reconocimiento tras tts:end
+        # ========================
+        # Para Opción 1 (OCR)
+        self._pending_ocr_after_tts: bool = False
+        self._ocr_capture_seconds: float | None = None
+        # Para Opción 2 (Currency/Dinero)
+        self._pending_currency_after_tts: bool = False
+        # Para Opción 3 (Expiry/Vencimiento)
+        self._pending_expiry_after_tts: bool = False
+        self._expiry_capture_seconds: float | None = None
+
+        self._register_events()
+
+        # Watchdog: si por algún driver no llega tts:end, reactivamos STT
+        self._watch_stop = threading.Event()
+        self._watcher = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watcher.start()
+
+    # -----------------------------
+    # Setup de eventos
+    # -----------------------------
+    def _register_events(self) -> None:
+        event_bus.subscribe("tts:start", self._on_tts_start)
+        event_bus.subscribe("tts:end", self._on_tts_end)
+        event_bus.subscribe("stt:text", self._on_stt_text)
+
+    def _set_state(self, new_state: State) -> None:
+        with self._lock:
+            old = self.state
+            self.state = new_state
+        event_bus.publish("ctrl:state", from_state=old, to=new_state)
+
+    # -----------------------------
+    # Utilidades internas
+    # -----------------------------
+    def _extract_name(self, raw_text: str) -> str:
+        """
+        Extrae un nombre propio desde frases naturales como
+        "me llamo Rico" o "mi nombre es Rico".
+        Si no reconoce ningn patrn, devuelve el texto tal cual.
+        """
+        text = (raw_text or "").strip()
+        lowered = text.lower()
+
+        patterns = [
+            "me llamo ",
+            "mi nombre es ",
+            "mi nombre es: ",
+            "mi nombre ",
+            "yo soy ",
+            "soy ",
+            "me dicen ",
+        ]
+
+        for p in patterns:
+            idx = lowered.find(p)
+            if idx != -1:
+                candidate = text[idx + len(p) :].strip()
+                if candidate:
+                    text = candidate
+                    break
+
+        # Casos donde el STT antepone "es " al nombre (p.ej., "es ricco")
+        if text.lower().startswith("es "):
+            text = text[3:]
+
+        # Otros casos: "nombre es ricco" o "nombre es: ricco"
+        if text.lower().startswith("nombre es"):
+            text = text[10:].lstrip(": ").strip()
+
+        text = text.strip(" .,!?:;")
+        return text
+
+    def _extract_seconds(self, raw_text: str) -> int | None:
+        """
+        Busca un numero en el texto y lo devuelve como segundos.
+        Acepta expresiones simples como "20", "20 segundos" o "20 seg".
+        """
+        if not raw_text:
+            return None
+        import re as _re
+        m = _re.search(r"(\d{1,3})", raw_text)
+        if not m:
+            # Intentar reconocer el número escrito en palabras (hasta 60)
+            normalized = raw_text.lower().strip()
+            text_numbers = {
+                "cinco": 5,
+                "diez": 10,
+                "quince": 15,
+                "veinte": 20,
+                "treinta": 30,
+                "cuarenta": 40,
+                "cincuenta": 50,
+                "sesenta": 60,
+            }
+            for word, value in text_numbers.items():
+                if word in normalized:
+                    return value
+            return None
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
+    def _is_new_user_utterance(self, raw_text: str) -> bool:
+        """
+        Detecta frases tipo "soy usuario nuevo" / "me quiero registrar".
+        """
+        t = (raw_text or "").lower()
+        return any(
+            kw in t
+            for kw in [
+                "usuario nuevo",
+                "soy nuevo",
+                "soy nueva",
+                "registr",
+                "crear una cuenta",
+                "crear mi cuenta",
+                "quiero registrarme",
+                "me voy a registrar",
+                "me voy a registro",
+                "me quiero registrar",
+            ]
+        )
+
+    def _is_existing_user_utterance(self, raw_text: str) -> bool:
+        """
+        Detecta frases tipo "ya tengo cuenta" mientras estamos pidiendo nombre de registro.
+        """
+        t = (raw_text or "").lower()
+        return any(
+            kw in t
+            for kw in [
+                "ya tengo cuenta",
+                "ya tengo una cuenta",
+                "ya estoy registrado",
+                "ya estoy registrada",
+                "no soy nuevo",
+                "no soy nueva",
+                "tengo cuenta",
+            ]
+        )
+
+    # -----------------------------
+    # Ciclo de vida
+    # -----------------------------
+    @staticmethod
+    def _number_to_words_es(num: int) -> str:
+        if num < 0:
+            return f"menos {Controller._number_to_words_es(abs(num))}"
+
+        units = [
+            "cero",
+            "uno",
+            "dos",
+            "tres",
+            "cuatro",
+            "cinco",
+            "seis",
+            "siete",
+            "ocho",
+            "nueve",
+        ]
+
+        special = {
+            10: "diez",
+            11: "once",
+            12: "doce",
+            13: "trece",
+            14: "catorce",
+            15: "quince",
+            16: "dieciseis",
+            17: "diecisiete",
+            18: "dieciocho",
+            19: "diecinueve",
+            20: "veinte",
+        }
+        for i in range(1, 10):
+            special[20 + i] = f"veinti{units[i]}"
+
+        tens = {
+            30: "treinta",
+            40: "cuarenta",
+            50: "cincuenta",
+            60: "sesenta",
+            70: "setenta",
+            80: "ochenta",
+            90: "noventa",
+        }
+
+        hundreds = {
+            2: "doscientos",
+            3: "trescientos",
+            4: "cuatrocientos",
+            5: "quinientos",
+            6: "seiscientos",
+            7: "setecientos",
+            8: "ochocientos",
+            9: "novecientos",
+        }
+
+        if num < 10:
+            return units[num]
+        if num < 30:
+            return special.get(num, "")
+        if num < 100:
+            ten = (num // 10) * 10
+            rest = num % 10
+            if rest == 0:
+                return tens.get(ten, str(num))
+            return f"{tens.get(ten, str(ten))} y {units[rest]}"
+        if num < 1000:
+            hundred = num // 100
+            rest = num % 100
+            if hundred == 1:
+                prefix = "cien" if rest == 0 else "ciento"
+            else:
+                prefix = hundreds.get(hundred, f"{units[hundred]}cientos")
+            if rest == 0:
+                return prefix
+            return f"{prefix} {Controller._number_to_words_es(rest)}"
+        if num < 10000:
+            thousand = num // 1000
+            rest = num % 1000
+            if thousand == 1:
+                prefix = "mil"
+            else:
+                prefix = f"{units[thousand]} mil"
+            if rest == 0:
+                return prefix
+            return f"{prefix} {Controller._number_to_words_es(rest)}"
+        return str(num)
+
+    def _normalize_tts_text(self, text: str) -> str:
+        if not text:
+            return text
+
+        def _repl(match: re.Match[str]) -> str:
+            value = int(match.group(0))
+            if value > 9999:
+                digits = " ".join(match.group(0))
+                return digits
+            return Controller._number_to_words_es(value)
+
+        return re.sub(r"\d+", _repl, text)
+
+    def start(self) -> None:
+        """Arranca el reconocimiento y da un saludo inicial por TTS."""
+        self.stt.start()
+        self.speak("Buenos días, soy OJOZ, tu asistente de visión artificial. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+
+    def speak(self, text: str) -> None:
+        """Envía texto a TTS (el gate de STT lo gestiona tts:start/tts:end o el watchdog)."""
+        # Publicar PRIMERO al chat (antes de que el TTS empiece a hablar)
+        event_bus.publish("ui:print", role="app/tts", text=text)
+        # Luego enviar al TTS para que hable
+        tts_text = self._normalize_tts_text(text)
+        self.tts.say(tts_text)
+        self._schedule_fallback_rearm()
+
+    # -----------------------------
+    # Handlers de eventos
+    # -----------------------------
+    def _on_tts_start(self) -> None:
+        # Gate: deshabilita escucha mientras el TTS habla
+        self.stt.enable_listening(False)
+        self._set_state("TTS_SPEAKING")
+
+    def _on_tts_end(self) -> None:
+        """
+        Cuando termina de hablar el TTS:
+        - Si hay una acción pendiente (enrolamiento o autenticación), ejecútala ahora.
+        - Si no, rearmar STT después de un pequeño delay.
+        """
+        # === Disparadores atados al fin del mensaje del TTS ===
+        # Enrolamiento: "Bienvenido {name}, mire a la camara..."
+        if self._pending_enroll_after_tts and self._user_name:
+            self._pending_enroll_after_tts = False
+            threading.Thread(target=self._enroll_workflow, args=(self._user_name,), daemon=True).start()
+            return  # no rearmar escucha aquí; el workflow maneja el audio
+
+        # Autenticación: "Por favor mire a la camara para verificar su identidad."
+        if self._pending_auth_after_tts:
+            self._pending_auth_after_tts = False
+            threading.Thread(target=self._auth_workflow, daemon=True).start()
+            return  # no rearmar escucha aquí; el workflow maneja el audio
+
+        # OCR (Opción 1): "Apunte la camara al texto..."
+        if self._pending_ocr_after_tts:
+            self._pending_ocr_after_tts = False
+            threading.Thread(target=self._ocr_workflow, daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
+        # Currency (Opción 2): "Muestre el billete o moneda a la camara..."
+        if self._pending_currency_after_tts:
+            self._pending_currency_after_tts = False
+            threading.Thread(target=self._currency_workflow, daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
+        # Expiry (Opción 3): "Muestre la fecha de vencimiento a la camara..."
+        if self._pending_expiry_after_tts:
+            self._pending_expiry_after_tts = False
+            capture_seconds = self._expiry_capture_seconds or 10.0
+            self._expiry_capture_seconds = None
+            threading.Thread(target=self._expiry_workflow, args=(capture_seconds,), daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
+        # Si no hay workflows pendientes, reactivar escucha normalmente
+        self._enable_listening_after_delay()
+
+    def _on_stt_text(self, text: str, confidence=None) -> None:
+        # Bloquea escucha mientras procesa la intención
+        self.stt.enable_listening(False)
+        self._set_state("PROCESSING")
+
+        # Verificar si estamos en un flujo de conversación específico
+        reply = None
+        
+        if self._conversation_state == "waiting_new_user_name":
+            lower = (text or "").lower()
+            if self._is_existing_user_utterance(lower):
+                # Corrige: dijo que ya tiene cuenta, cambiar al flujo de usuario recurrente
+                self._conversation_state = "waiting_returning_user_name"
+                self._user_name = None
+                reply = "Entiendo, ya tienes cuenta. ¿Cuál es tu nombre para verificar tu identidad?"
+            else:
+                # El usuario acaba de decirnos su nombre para registro
+                self._user_name = self._extract_name(text)
+                self._conversation_state = None  # Salir del flujo
+
+                # Verificar si el usuario ya está registrado en la BD
+                if dao.user_exists(self._user_name):
+                    # Usuario ya existe, redirigir a autenticación
+                    self._pending_auth_after_tts = True
+                    reply = "Tu ya tienes una cuenta creada, por favor mire a la camara para verificar identidad."
+                else:
+                    # Usuario nuevo, proceder con captura y entrenamiento
+                    self._pending_enroll_after_tts = True
+                    reply = f" {self._user_name}, mire a la cámara. Vamos a crearte una cuenta."
+        
+        elif self._conversation_state == "waiting_returning_user_name":
+            lower = (text or "").lower()
+            if self._is_new_user_utterance(lower):
+                # Corrige: si dice que quiere registrarse, saltar al flujo de registro
+                self._conversation_state = "waiting_new_user_name"
+                self._user_name = None
+                reply = "Entiendo, eres usuario nuevo. ¿Cómo te llamas para crear tu cuenta?"
+            else:
+                # El usuario que vuelve nos dijo su nombre
+                self._user_name = self._extract_name(text)
+                
+                # Verificar si el usuario existe en la base de datos
+                if dao.user_exists(self._user_name):
+                    # Usuario encontrado, proceder con autenticación facial
+                    self._conversation_state = None  # Salir del flujo
+                    self._pending_auth_after_tts = True
+                    reply = f"¡ Un gusto tenerte de vuelta {self._user_name}!, mire a la cámara para verificar identidad por favor."
+                else:
+                    # Usuario no encontrado: preguntar si desea registrarse
+                    self._conversation_state = "confirm_register_for_returning"
+                    reply = f"{self._user_name}, aun no tienes una cuenta conmigo. ¿Deseas registrarte?"
+        
+        elif self._conversation_state == "confirm_register_for_returning":
+            lower = (text or "").lower()
+
+            positives = [
+                "si",
+                "sí",
+                "claro",
+                "por supuesto",
+                "me encantaria",
+                "me encantaría",
+                "me gustaria",
+                "me gustaría",
+                "me encantaría hacerlo",
+                "dale",
+                "ok",
+            ]
+            negatives = [
+                "no",
+                "ahora no",
+                "no gracias",
+                "prefiero que no",
+                "despues",
+                "después",
+                "tal vez luego",
+                "en otro momento",
+            ]
+
+            def _matches(words: list[str]) -> bool:
+                return any(phrase in lower for phrase in words)
+
+            if _matches(positives):
+                self._conversation_state = "waiting_new_user_name"
+                reply = "Perfecto, ¿como te llamas para crear tu cuenta?"
+            elif _matches(negatives):
+                nombre = self._user_name or "amigo"
+                self._conversation_state = None
+                self._user_name = None
+                reply = f"Esta bien {nombre}, vuelve cuando desees hacerlo."
+            else:
+                self._conversation_state = "waiting_new_user_name"
+                reply = "Para registrarte necesito tu nombre. ¿Como te llamas?"
+
+        elif self._conversation_state == "waiting_new_user_name":
+            lower = (text or "").lower()
+            if self._is_existing_user_utterance(lower):
+                self._conversation_state = "waiting_returning_user_name"
+                self._user_name = None
+                reply = "Entiendo, ya tienes cuenta. ¿Cual es tu nombre para verificar identidad?"
+            else:
+                self._user_name = self._extract_name(text)
+                self._conversation_state = None
+                self._pending_enroll_after_tts = True
+                reply = f"Perfecto, {self._user_name}. Vamos a crearte una cuenta. Mira a la camara cuando te lo indique."
+        
+        elif self._conversation_state == "waiting_ocr_more_time":
+            lower = (text or "").lower()
+            secs = self._extract_seconds(lower)
+            if secs is not None:
+                secs = max(5, min(secs, 60))
+                self._ocr_capture_seconds = float(secs)
+                self._pending_ocr_after_tts = True
+                self._conversation_state = None
+                reply = f"Perfecto, esperare {secs} segundos antes de capturar."
+            elif any(kw in lower for kw in ("ya esta", "ya esta,", "ya esta.", "toma la captura", "captura ahora")):
+                self._conversation_state = None
+                self._ocr_capture_seconds = None
+                self._pending_ocr_after_tts = True
+                reply = "De acuerdo, capturo ahora."
+            elif any(kw in lower for kw in ("no", "ya no", "mejor ya no", "otra opcion", "luego")):
+                self._conversation_state = None
+                nombre = self._user_name or "amigo"
+                reply = f"Esta bien, {nombre}. Necesitas ayuda en algo mas?"
+            elif any(kw in lower for kw in ("si", "claro", "dale")):
+                self._conversation_state = "waiting_ocr_seconds"
+                reply = "Cuanto tiempo necesitas para enfocar bien el documento en la camara?"
+            else:
+                reply = "Cuanto tiempo necesitas para enfocar bien el documento en la camara? Dime por ejemplo 10 segundos, o di que no."
+
+        elif self._conversation_state == "waiting_ocr_seconds":
+            lower = (text or "").lower()
+            if any(kw in lower for kw in ("ya esta", "ya esta,", "ya esta.", "toma la captura", "captura ahora")):
+                self._conversation_state = None
+                self._ocr_capture_seconds = None
+                self._pending_ocr_after_tts = True
+                reply = "Listo, capturo ahora."
+            else:
+                secs = self._extract_seconds(lower)
+                if secs is not None:
+                    secs = max(5, min(secs, 60))
+                    self._ocr_capture_seconds = float(secs)
+                    self._pending_ocr_after_tts = True
+                    self._conversation_state = None
+                    reply = f"Te doy {secs} segundos para enfocar. Si estas listo antes, di 'ya esta' y capturo de inmediato."
+                else:
+                    reply = "Cuanto tiempo necesitas para enfocar bien el documento en la camara?"
+        elif self._conversation_state == "waiting_expiry_more_time":
+            lower = (text or "").lower()
+            secs = self._extract_seconds(lower)
+            positives = ("si", "sí", "claro", "dale", "ok", "vale", "por favor", "porfa", "porfabor")
+            negatives = ("no", "ya no", "otra opcion", "mejor no", "luego")
+            if secs is not None:
+                secs = max(5, min(secs, 60))
+                self._expiry_capture_seconds = float(secs)
+                self._pending_expiry_after_tts = True
+                self._conversation_state = None
+                reply = f"De acuerdo, te dare {secs} segundos adicionales para enfocar la fecha."
+            elif any(kw in lower for kw in positives):
+                # Respuesta positiva sin numero: usar un valor por defecto rapido
+                default_secs = 10.0
+                self._expiry_capture_seconds = default_secs
+                self._pending_expiry_after_tts = True
+                self._conversation_state = None
+                reply = f"De acuerdo, usare {int(default_secs)} segundos para capturar la fecha."
+            elif any(kw in lower for kw in negatives):
+                self._conversation_state = None
+                nombre = self._user_name or "amigo"
+                reply = f"Esta bien {nombre}, ¿Necesitas ayuda en algo mas?"
+            else:
+                reply = "¿Deseas que te de mas tiempo? Dime 'si' o 'no'."
+        elif self._conversation_state == "waiting_expiry_seconds":
+            lower = (text or "").lower()
+            secs = self._extract_seconds(lower)
+            positives = ("si", "sí", "claro", "dale", "ok", "vale", "por favor", "porfa")
+            if secs is not None:
+                secs = max(5, min(secs, 60))
+                self._expiry_capture_seconds = float(secs)
+                self._pending_expiry_after_tts = True
+                self._conversation_state = None
+                reply = f"Perfecto, usare {secs} segundos para capturar la fecha."
+            elif any(kw in lower for kw in ("ya esta", "captura ahora", "toma la captura")):
+                self._conversation_state = None
+                self._expiry_capture_seconds = None
+                self._pending_expiry_after_tts = True
+                reply = "Entendido, capturo ahora."
+            elif any(kw in lower for kw in positives):
+                default_secs = 10.0
+                self._expiry_capture_seconds = default_secs
+                self._pending_expiry_after_tts = True
+                self._conversation_state = None
+                reply = f"Perfecto, usare {int(default_secs)} segundos para capturar la fecha."
+            elif any(kw in lower for kw in ("no", "ya no", "mejor no", "luego")):
+                self._conversation_state = None
+                nombre = self._user_name or "amigo"
+                reply = f"Esta bien {nombre}, ¿Necesitas ayuda en algo mas?"
+            else:
+                reply = "¿Cuanto tiempo necesitas para mostrar la fecha? Por ejemplo 10 segundos."
+        else:
+            # Procesamiento normal de intenciones
+            reply = self._handle_intent(text)
+
+        if reply:
+            self.speak(reply)
+        else:
+            # Mensaje amable cuando no se comprende la intención
+            self.speak("No te logré escuchar muy bien, podrías repetirlo por favor.")
+
+    # -----------------------------
+    # Intents
+    # -----------------------------
+    def _handle_intent(self, text: str) -> str | None:
+        intent = infer_intent(text)
+
+        if intent == "exit":
+            # Despedida y reinicio del flujo (no cerrar la app)
+            farewell = f"Adios {self._user_name}, espero vuelvas pronto." if self._user_name else "Adios, espero vuelvas pronto."
+
+            # Resetear el estado del controller
+            self._user_name = None
+            self._authenticated = False
+            self._conversation_state = None
+            self._pending_enroll_after_tts = False
+            self._pending_auth_after_tts = False
+
+            # Programar reinicio del flujo tras la despedida
+            import time
+
+            def _restart_flow():
+                time.sleep(1.5)  # Esperar un poco después de la despedida
+                self.speak("Buenos días, soy OJOZ, tu asistente de visión artificial. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+
+            threading.Thread(target=_restart_flow, daemon=True).start()
+            # Devolver el mensaje de despedida (lo dirá _on_stt_text)
+            return farewell
+
+        if intent == "shutdown":
+            # Cerrar la aplicación completamente
+            event_bus.publish("app:shutdown")
+
+            # Apagar audio con gracia en un hilo aparte
+            def _shutdown():
+                self.tts.join()
+                self.stt.stop()
+                self.tts.shutdown()
+            threading.Thread(target=_shutdown, daemon=True).start()
+
+            return "Ok, cerrando la aplicación. Hasta luego!"
+
+        if intent == "greet":
+            return "¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?"
+
+        if intent == "show_menu":
+            # Mostrar menú de opciones disponibles
+            if self._authenticated and self._user_name:
+                return (
+                    "Puedo ayudarte con varias cosas:\n"
+                    "1. Leer lo que aparece en la cámara.\n"
+                    "2. Decirte el valor del dinero que me estés mostrando.\n"
+                    "3. Revisar la fecha de vencimiento de un producto.\n"
+                    "4. Describir todo lo que ve la camara (te dare un enlace).\n"
+                    f"¿Qué opción deseas, {self._user_name}?"
+                )
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        if intent == "new_user_option":
+            # Si ya está autenticado, interpretar como Opción 1 del menú
+            if self._authenticated and self._user_name:
+                self._pending_ocr_after_tts = True
+                return "Entendido, apunte la camara al documento para leerlo."
+            # Iniciar flujo de usuario nuevo → pedimos nombre
+            self._conversation_state = "waiting_new_user_name"
+            return "¿Me compartes tu nombre?"
+
+        if intent == "returning_user_option":
+            # Si ya está autenticado, interpretar como Opción 2 del menú
+            if self._authenticated and self._user_name:
+                self._pending_currency_after_tts = True
+                return "Entendido, muestre el billete o moneda a la camara."
+            # Actualizado: opción 2 pide nombre para buscar en BD
+            self._conversation_state = "waiting_returning_user_name"
+            return "Que bueno tenerte de vuelta, cual es tu nombre para verificar identidad?"
+
+        if intent == "open_camera":
+            # Mantengo tu intent original; ahora la cámara se usa en workflows.
+            return "Abriendo cámara."
+        # ===== Primera opción del menú: Leer documento (OCR) =====
+        if intent == "read_image":
+            if self._authenticated and self._user_name:
+                # Lanza el OCR tras terminar el mensaje de TTS
+                self._pending_ocr_after_tts = True
+                return "Entendido, apunte la camara al documento para leerlo."
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        # ===== Segunda opción del menú: Reconocer valor del dinero (Currency) =====
+        # "recognize_currency" es el nombre historico del mismo intent.
+        if intent in ("currency_value", "recognize_currency"):
+            if self._authenticated and self._user_name:
+                # Lanza el reconocimiento de dinero tras terminar el mensaje de TTS
+                self._pending_currency_after_tts = True
+                return "Entendido, muestre el billete o moneda a la camara."
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        # ===== Tercera opción del menú: Verificar fecha de vencimiento (Expiry) =====
+        if intent == "verify_expiry":
+            if self._authenticated and self._user_name:
+                # Lanza la verificación de vencimiento tras terminar el mensaje de TTS
+                self._pending_expiry_after_tts = True
+                return "Entendido, muestre la fecha de vencimiento del producto a la camara."
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        # ===== Cuarta opción del menú: Describir todo lo que ve (enlace externo) =====
+        if intent == "describe_everything":
+            if self._authenticated and self._user_name:
+                return "Entra al siguiente link https://ojoz-tts-820628120958.southamerica-west1.run.app"
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        return None
+
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def _enable_listening_after_delay(self):
+        self._cancel_fallback_rearm()
+        delay = getattr(config, "rearm_stt_delay_ms", 400) / 1000.0
+
+        def _reactivate():
+            time.sleep(delay)
+            # Solo reactivar si no estamos ya escuchando
+            with self._lock:
+                if self.state == "LISTENING":
+                    return
+            self.stt.enable_listening(True)
+            self._set_state("LISTENING")
+
+        # Reactivar en un hilo para no bloquear al publicador del evento
+        threading.Thread(target=_reactivate, daemon=True).start()
+
+    def _schedule_fallback_rearm(self) -> None:
+        failsafe_ms = getattr(config, "rearm_stt_failsafe_ms", 8000)
+        if failsafe_ms <= 0:
+            return
+
+        timer = threading.Timer(failsafe_ms / 1000.0, self._force_enable_listening)
+        timer.daemon = True
+
+        self._cancel_fallback_rearm()
+        with self._lock:
+            self._fallback_timer = timer
+        timer.start()
+
+    def _cancel_fallback_rearm(self) -> None:
+        timer = None
+        with self._lock:
+            if self._fallback_timer is not None:
+                timer = self._fallback_timer
+                self._fallback_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _force_enable_listening(self) -> None:
+        with self._lock:
+            self._fallback_timer = None
+            current_state = self.state
+
+        # Solo reactivar si no estamos ya escuchando
+        if current_state == "LISTENING":
+            return
+
+        self.stt.enable_listening(True)
+        self._set_state("LISTENING")
+
+    def _watchdog_loop(self):
+        """
+        Revisa periódicamente si el TTS ya no está hablando pero seguimos en TTS_SPEAKING.
+        Si eso pasa (p.ej., faltó 'tts:end'), reactiva la escucha.
+        """
+        while not self._watch_stop.is_set():
+            time.sleep(0.15)
+            with self._lock:
+                current = self.state
+            if current == "TTS_SPEAKING" and not self.tts.is_speaking():
+                # Fallback por watchdog
+                self._enable_listening_after_delay()
+
+    def stop(self):
+        self._watch_stop.set()
+        self._cancel_fallback_rearm()
+
+    # =============================
+    # NUEVOS WORKFLOWS (visión)
+    # =============================
+    def _enroll_workflow(self, name: str):
+        """Captura N fotos del usuario y reentrena el modelo LBPH."""
+        from app.utils.logger import logger
+        from pathlib import Path
+        
+        try:
+            # Bloquear escucha durante enrolamiento
+            self.stt.enable_listening(False)
+            event_bus.publish("camera.opened", index=vision.camera_index)
+            event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros para {name}...")
+            
+            logger.info(f"=== INICIO ENROLAMIENTO: {name} ===")
+            
+            # 1. Crear o recuperar el usuario en la BD
+            user_id = dao.get_or_create_user(name)
+            logger.info(f"Usuario en BD: id={user_id}, nombre={name}")
+
+            # 2. Capturar fotos
+            saved = capture_faces(name=name, count=vision.capture_count, show_preview=vision.show_preview)
+            logger.info(f"Captura completada: {saved} fotos")
+
+            if saved < 10:
+                raise RuntimeError(f"Se capturaron muy pocas fotos ({saved}). Se requieren al menos 10.")
+
+            # 3. Registrar las fotos en la BD
+            user_folder = get_user_folder(name)
+            photo_files = sorted(user_folder.glob("rostro_*.jpg"))
+            photo_paths = [str(p.relative_to(vision.base_dir)) for p in photo_files]
+            
+            if photo_paths:
+                dao.insert_face_photos(user_id, photo_paths, vision.face_size[0], vision.face_size[1])
+                logger.info(f"Registradas {len(photo_paths)} fotos en la BD")
+            
+            # 4. Registrar la sesión de enrolamiento
+            enrollment_id = dao.insert_enrollment(user_id, saved, notes=f"Captura automática de {saved} rostros")
+            logger.info(f"Enrollment registrado con id={enrollment_id}")
+
+            # 5. Entrenar el modelo
+            event_bus.publish("ui:print", role="sys", text=f"Se capturaron {saved} rostros. Entrenando modelo...")
+            logger.info("Iniciando entrenamiento del modelo...")
+            
+            model_path = train_dataset()
+            logger.info(f"Modelo entrenado exitosamente: {model_path}")
+
+            # 6. Registrar el modelo en la BD
+            model_relative = str(Path(model_path).relative_to(vision.base_dir))
+            model_id = dao.upsert_global_model(
+                file_path=model_relative,
+                threshold=float(vision.lbph_threshold),
+                version="1.0"
+            )
+            logger.info(f"Modelo registrado en BD con id={model_id}")
+
+            event_bus.publish("camera.closed", index=vision.camera_index)
+            # Confirmar por voz
+            self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
+            event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
+            event_bus.publish("ui:print", role="sys", text=f"[OK] Modelo actualizado: {model_path}")
+            logger.info(f"=== FIN ENROLAMIENTO EXITOSO: {name} ===")
+            
+            # Continuar el flujo sin regresar al saludo inicial
+            def _continue_after_enroll():
+                time.sleep(1.5)  # Esperar un poco después del mensaje de confirmación
+                self._user_name = name
+                self._authenticated = True
+                self._conversation_state = None
+                self._pending_enroll_after_tts = False
+                self._pending_auth_after_tts = False
+                self.speak(f"Un gusto conocerte, {name}. ¿En qué puedo ayudarte?")
+            
+            threading.Thread(target=_continue_after_enroll, daemon=True).start()
+            
+        except Exception as e:
+            logger.error(f"Error en enrolamiento: {e}", exc_info=True)
+            self.speak("Hubo un problema durante el registro. Intente nuevamente.")
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+        finally:
+            # La reactivación de STT se hará tras tts:end del mensaje final
+            pass
+
+    def _auth_workflow(self):
+        """Reconocimiento facial (LBPH) durante unos segundos y saluda si se reconoce."""
+        from app.utils.logger import logger
+        
+        try:
+            # Bloquear escucha durante autenticación
+            self.stt.enable_listening(False)
+            event_bus.publish("camera.opened", index=vision.camera_index)
+            event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
+
+            ok, recognized_name, conf = recognize_best_frame(seconds=5.0)
+
+            event_bus.publish("camera.closed", index=vision.camera_index)
+            
+            logger.info(f"Resultado autenticación: ok={ok}, nombre={recognized_name}, confianza={conf}, esperado={self._user_name}")
+
+            if ok and recognized_name:
+                # Se reconoció un rostro
+                if self._user_name and recognized_name.lower() == self._user_name.lower():
+                    # El nombre coincide con el esperado
+                    self._authenticated = True  # Marcar como autenticado
+                    self.speak(f"Un gusto conocerte, {self._user_name}. ¿En qué puedo ayudarte?")
+                    event_bus.publish("ui:print", role="sys", text=f"[OK] Autenticación exitosa: {self._user_name}")
+                else:
+                    # Se reconoció pero NO es la persona esperada
+                    self._authenticated = False
+                    self._conversation_state = "waiting_returning_user_name"  # Volver a pedir nombre
+                    self.speak(f"Tu no eres {self._user_name}, por favor digame correctamente su nombre.")
+                    # Solo registrar en logs; no mostrar mensaje técnico en el chat de la interfaz
+                    logger.warning(f"Usuario reconocido como '{recognized_name}' pero se esperaba '{self._user_name}'")
+                    self._user_name = None
+            else:
+                # No se pudo reconocer con suficiente confianza
+                self._authenticated = False
+                
+                if conf is None:
+                    # No se detectó ningún rostro - ofrecer registro
+                    msg = "No detectó ningun rostro ¿Desea registraste?"
+                    self._conversation_state = None  # Permitir que elija opción 1 o diga nombre
+                else:
+                    # Baja confianza - volver a pedir nombre
+                    msg = "No se pudo reconocer de forma satisfactoria. Por favor digame su nombre de nuevo."
+                    self._conversation_state = "waiting_returning_user_name"  # Volver a pedir nombre
+                
+                self.speak(msg)
+                event_bus.publish("ui:print", role="sys", text=f"[FALLO] Reconocimiento fallido (confianza: {conf})")
+                self._user_name = None
+
+        except FileNotFoundError:
+            # Modelo inexistente
+            self.speak("Aun no hay modelo de reconocimiento. Por favor registrese primero con la opcion uno.")
+            event_bus.publish("ui:print", role="sys", text="[FALLO] Modelo de reconocimiento no encontrado")
+        except Exception as e:
+            logger.error(f"Error en autenticación: {e}", exc_info=True)
+            self.speak("Ocurrio un error durante la autenticacion.")
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+        finally:
+            # La reactivación de STT se hará tras tts:end del mensaje final
+            pass
+
+    # ======== NUEVO: OCR (Opción 1) ========
+    def _ocr_workflow(self):
+        """
+        Captura durante unos segundos, realiza OCR (Tesseract) y lee en voz alta el texto.
+        """
+        from app.utils.logger import logger
+
+        sid = None
+        try:
+            # Registrar sesión en BD (si el DAO lo soporta)
+            try:
+                sid = dao.start_session("ocr", None)
+            except Exception:
+                sid = None
+
+            # Bloquear escucha durante el OCR
+            self.stt.enable_listening(False)
+            event_bus.publish("ui:print", role="sys", text="Preparando cámara para capturar documento...")
+
+            capture_seconds = self._ocr_capture_seconds or 10.0
+            self._ocr_capture_seconds = None
+            self.speak(f"Muestre el documento frente a la camara. La captura se realizara en {int(capture_seconds)} segundos.")
+            
+            # Capturar foto y procesar (ventana configurable para enfocar)
+            ok, text, conf = read_text_best_frame(seconds=capture_seconds, lang='spa')
+
+            if ok and text:
+                # Guardar en BD si está disponible
+                try:
+                    if sid is not None:
+                        dao.insert_ocr_result(sid, text=text, language=None, confidence=conf)
+                        dao.finish_session(sid, ok=True, details=f"conf={conf}")
+                except Exception:
+                    pass
+
+                # Limitar TTS si el texto es muy largo
+                MAX_TTS_CHARS = 1200  # Aumentado para documentos más largos
+                spoken = text[:MAX_TTS_CHARS] + (" …" if len(text) > MAX_TTS_CHARS else "")
+
+                event_bus.publish("ui:print", role="sys", text=f"[OK] OCR listo (conf={conf:.1f}%)" if conf else "[OK] OCR listo")
+                event_bus.publish("ui:print", role="app/ocr", text=text)
+
+                # Leer por voz con introducción
+                word_count = len(text.split())
+                self.speak(f"He detectado {word_count} palabras. Leyendo contenido:")
+                self.speak(spoken)
+            else:
+                try:
+                    if sid is not None:
+                        dao.finish_session(sid, ok=False, details=f"conf={conf}")
+                except Exception:
+                    pass
+                event_bus.publish("ui:print", role="sys", text="[FALLO] No encontré texto en el documento")
+                self._conversation_state = "waiting_ocr_more_time"
+                self.speak("No encontré texto que leer. ¿Necesitas más tiempo?")
+        except Exception as e:
+            logger.error(f"Error en OCR: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR OCR] {e}")
+            self.speak("Ocurrio un error leyendo el texto.")
+            try:
+                if sid is not None:
+                    dao.finish_session(sid, ok=False, details=repr(e))
+            except Exception:
+                pass
+        finally:
+            # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
+            pass
+
+    # ======== NUEVO: CURRENCY (Opción 2) ========
+    def _currency_workflow(self):
+        """
+        Detecta el valor de billetes (10, 20, 50, 100, 200 soles) o monedas.
+        Usa OCR en región central del billete para leer el número grande.
+        """
+        from app.utils.logger import logger
+
+        sid = None
+        try:
+            # Registrar sesión en BD
+            try:
+                sid = dao.start_session("currency", None)
+            except Exception:
+                sid = None
+
+            # Bloquear escucha durante la detección
+            self.stt.enable_listening(False)
+            event_bus.publish("ui:print", role="sys", text="Preparando cámara, por favor mantenga quieto el billete...")
+            self.speak("Muestre el billete o moneda a la camara. Tendra 15 segundos para posicionar el billete.")
+            
+            # Detectar dinero (15 segundos de captura para mejor posicionamiento)
+            ok, curr, value, conf = detect_currency_best_frame(seconds=15.0)
+
+            if ok and value is not None:
+                # Guardar en BD si está disponible
+                try:
+                    if sid is not None:
+                        dao.insert_currency_detection(sid, currency=curr or "PEN", value=float(value), confidence=conf)
+                        dao.finish_session(sid, ok=True, details=f"{curr} {value}, conf={conf}")
+                except Exception:
+                    pass
+
+                # Formatear valor para TTS y UI usando la divisa detectada.
+                # curr puede ser None si no se identifico la divisa; en ese caso
+                # se habla de "unidades" y si es una divisa desconocida se usa su
+                # propio codigo.
+                moneda_natural = _CURR_TO_UNIT.get(curr, curr) if curr else "unidades"
+
+                es_entero = abs(value - int(value)) < 1e-6
+                value_str = str(int(value)) if es_entero else f"{value:.2f}"
+
+                # Determinar si es billete o moneda (heurística simple)
+                tipo = "un billete de" if value >= 10 else "una moneda de"
+
+                # Responder por voz usando la moneda detectada
+                self.speak(f"Detecté {tipo} {value_str} {moneda_natural}.")
+
+                conf_str = f" (conf={conf:.1f}%)" if conf is not None else ""
+                event_bus.publish("ui:print", role="sys", text=f"[OK] Detectado: {curr} {value_str}{conf_str}")
+                event_bus.publish("ui:print", role="app/currency", text=f"Valor: {value_str} {moneda_natural}")
+                
+            else:
+                try:
+                    if sid is not None:
+                        dao.finish_session(sid, ok=False, details=f"conf={conf}")
+                except Exception:
+                    pass
+                
+                event_bus.publish("ui:print", role="sys", text="[FALLO] No pude detectar el valor del dinero")
+                self.speak("No pude determinar el valor de ese dinero. Intente con mejor iluminacion o acercando mas el billete a la camara.")
+                
+        except Exception as e:
+            logger.error(f"Error en currency workflow: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR CURRENCY] {e}")
+            self.speak("Ocurrio un error al identificar el dinero.")
+            try:
+                if sid is not None:
+                    dao.finish_session(sid, ok=False, details=repr(e))
+            except Exception:
+                pass
+        finally:
+            # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
+            pass
+
+    # ======== NUEVO: EXPIRY (Opción 3) ========
+    def _expiry_workflow(self, capture_seconds: float = 10.0):
+        """
+        Lee la fecha de vencimiento y determina si el producto está vencido.
+        Busca palabras clave como "vencimiento", "caducidad", "exp", etc.
+        """
+        from app.utils.logger import logger
+
+        sid = None
+        try:
+            # Registrar sesión en BD
+            try:
+                sid = dao.start_session("expiry", None)
+            except Exception:
+                sid = None
+
+            # Bloquear escucha durante la detección
+            self.stt.enable_listening(False)
+            event_bus.publish("ui:print", role="sys", text="Preparando cámara para verificar fecha de vencimiento...")
+            self.speak("Muestre la fecha de vencimiento del producto a la camara. La verificacion comenzara ahora.")
+            
+            # Verificar vencimiento con ventana configurable
+            ok, date_text, is_expired, conf = check_expiry_best_frame(seconds=capture_seconds)
+
+            if ok and date_text:
+                # Guardar en BD si está disponible
+                try:
+                    if sid is not None:
+                        dao.insert_expiry_check(
+                            session_id=sid,
+                            product_name=None,
+                            expiry_date=date_text,
+                            is_expired=bool(is_expired),
+                            confidence=conf if conf is not None else 0.0,
+                            raw_text=None,
+                        )
+                        dao.finish_session(sid, ok=True, details=f"{date_text}, vencido={is_expired}, conf={conf}")
+                except Exception:
+                    pass
+
+                # Responder por voz según el estado
+                if is_expired:
+                    self.speak(f"El producto esta vencido. La fecha de vencimiento era {date_text}.")
+                    status_label = "VENCIDO"
+                else:
+                    self.speak(f"El producto no esta vencido. La fecha de vencimiento es {date_text}.")
+                    status_label = "VIGENTE"
+
+                detalle = f"{status_label}: {date_text}"
+                if conf is not None:
+                    detalle += f" (conf={conf:.1f}%)"
+                event_bus.publish("ui:print", role="sys", text=detalle)
+                
+                event_bus.publish("ui:print", role="app/expiry", text=f"Fecha: {date_text} - Estado: {'VENCIDO' if is_expired else 'VIGENTE'}")
+                
+            else:
+                try:
+                    if sid is not None:
+                        dao.finish_session(sid, ok=False, details=f"conf={conf}")
+                except Exception:
+                    pass
+                
+                event_bus.publish("ui:print", role="sys", text="[FALLO] No pude leer la fecha de vencimiento")
+                self._conversation_state = "waiting_expiry_more_time"
+                self._expiry_capture_seconds = None
+                self.speak("No pude leer la fecha de vencimiento con claridad. ¿Deseas más tiempo?")
+                
+        except Exception as e:
+            logger.error(f"Error en expiry workflow: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR EXPIRY] {e}")
+            self.speak("Ocurrio un error al verificar la fecha de vencimiento.")
+            try:
+                if sid is not None:
+                    dao.finish_session(sid, ok=False, details=repr(e))
+            except Exception:
+                pass
+        finally:
+            # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
+            pass
+            pass

@@ -1,0 +1,26 @@
+# Entorno e intermedios de Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Datos generados en tiempo de ejecucion.
+# IMPORTANTE: contienen datos personales y biometricos (fotografias de rostro,
+# nombres de usuario y resultados de inferencia). No deben publicarse.
+data/db/
+data/fotos/
+data/modelos/
+data/ocr/
+
+# Material audiovisual pesado que no usa la aplicacion (los assets que si se
+# cargan en tiempo de ejecucion, como assets/images y assets/sounds, si se versionan).
+assets/gifs/OJOZIntro.gif
+assets/videos/
+
+# Salidas de las utilidades de diagnostico
+test_cam_*.jpg
+
+# Copias de trabajo
+*.bak
+*.new
+temp_backup/

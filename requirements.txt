@@ -1,0 +1,30 @@
+# OJOZ - dependencias de Python.
+# Versiones fijadas a las que estan verificadas en el entorno de desarrollo.
+#
+# Requisito externo NO instalable por pip:
+#   Tesseract OCR  ->  https://github.com/UB-Mannheim/tesseract/wiki
+#   Instalar con el paquete de idioma español ("spa").
+#   Por defecto se busca en C:\Program Files\Tesseract-OCR\tesseract.exe;
+#   se puede cambiar con la variable de entorno TESSERACT_CMD.
+
+# --- Interfaz ---
+flet==0.86.5
+flet-desktop==0.86.5
+
+# --- Audio: sintesis y reconocimiento de voz ---
+gTTS==2.5.4
+pyttsx3==2.99
+pygame==2.6.1
+SpeechRecognition==3.17.0
+PyAudio==0.2.14
+pocketsphinx==5.1.1
+
+# --- Vision por computador y OCR ---
+opencv-contrib-python==5.0.0.93
+numpy==2.5.1
+imutils==0.5.4
+pytesseract==0.3.13
+pillow==12.3.0
+
+# --- Utilidades ---
+colorama==0.4.6

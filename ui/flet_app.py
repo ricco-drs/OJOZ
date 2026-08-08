@@ -1,0 +1,859 @@
+"""
+Interfaz Ultra Moderna con Flet para OJOZ
+Diseño Glassmorphism con animaciones y efectos premium
+"""
+import flet as ft
+from datetime import datetime
+from threading import Thread
+import cv2
+import base64
+import time
+import unicodedata
+
+
+class OJOZApp:
+    def __init__(self, controller=None):
+        self.controller = controller
+        self.page = None
+        self.chat_messages = None
+        self.camera_preview = None
+        self.status_text = None
+        self.camera_active = False
+        self.preview_thread = None
+        self.header_container = None
+        self.animate_header = True
+        
+        # Importar event_bus GLOBAL
+        from app.core.event_bus import event_bus
+        self.event_bus = event_bus
+        
+        # Suscribirse a eventos
+        self.event_bus.subscribe("ui:print", self._on_ui_print)
+        self.event_bus.subscribe("tts:start", self._on_tts_start)
+        self.event_bus.subscribe("tts:end", self._on_tts_end)
+        self.event_bus.subscribe("stt:text", self._on_stt_text)
+        self.event_bus.subscribe("camera:start", self._on_camera_start)
+        self.event_bus.subscribe("camera:stop", self._on_camera_stop)
+        
+        print("[UI DEBUG] Event bus subscriptions registered!")
+    
+    # -----------------------------
+    # Helpers para el arranque
+    # -----------------------------
+    def attach_controller(self, controller) -> None:
+        """Permite asignar el controller real una vez que termina el bootstrap."""
+        self.controller = controller
+        self.update_status_badge(self._status_label())
+
+    def _run_on_ui(self, fn) -> None:
+        """
+        Ejecuta `fn` (funcion normal, no corutina) en el contexto de la pagina.
+
+        Los flujos de OJOZ corren en hilos de fondo (bootstrap, TTS, STT, vision)
+        y no pueden tocar los controles directamente: Page.run_thread() reenvia la
+        llamada al executor de la pagina y le adjunta el contexto necesario para
+        que page.update() surta efecto.
+
+        Nota: Page.run_task() NO sirve aqui, exige una corutina y lanza
+        TypeError("handler must be a coroutine function") con funciones normales.
+        """
+        if not self.page:
+            return
+        try:
+            self.page.run_thread(fn)
+        except Exception as e:
+            print(f"[UI WARNING] No se pudo programar la actualizacion de UI: {e}")
+
+    def update_status_badge(self, text: str, color: str = "#ffffff") -> None:
+        """Actualiza el badge superior (thread-safe)."""
+        if not self.status_text or not self.page:
+            return
+
+        def _update():
+            self.status_text.value = text
+            self.status_text.color = color
+            self.page.update()
+
+        self._run_on_ui(_update)
+
+    def show_bootstrap_message(self, text: str) -> None:
+        """
+        Muestra mensajes informativos del arranque sin llenar el chat.
+        Se imprime solo en la consola para mantener limpia la interfaz.
+        """
+        print(f"[BOOTSTRAP] {text}")
+
+    def current_user_name(self) -> str:
+        if self.controller:
+            return getattr(self.controller, "_user_name", "Usuario")
+        return "Iniciando..."
+
+    # Alias historico mantenido por compatibilidad.
+    _current_user_name = current_user_name
+
+    def _status_label(self) -> str:
+        """Texto amigable para el badge superior."""
+        name = self.current_user_name()
+        if self.controller and getattr(self.controller, "_authenticated", False) and name and name not in ("Usuario", "Iniciando..."):
+            return f"Usuario verificado: {name}"
+        if name and name not in ("Usuario", "Iniciando..."):
+            return f"Usuario: {name}"
+        return "Esperando usuario..."
+    
+    def _on_ui_print(self, **kwargs):
+        """Agregar mensaje al chat cuando el sistema habla"""
+        text = kwargs.get("text", "")
+        role = kwargs.get("role", "sys")
+
+        def _norm(s: str) -> str:
+            if not s:
+                return ""
+            return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)).lower()
+        
+        # Lista de palabras clave para OCULTAR del chat (solo mensajes técnicos)
+        FILTROS_OCULTAR = [
+            # Mensajes técnicos de micrófono
+            "Microfono calibrado",
+            "Vosk no configurado",
+            "gTTS",
+            "Vosk model cargado",
+            "Microfono en pausa",
+            "Microfono activo (escuchando",
+            "idx=",
+            "nombre='",
+            "device_index",
+            "VOSK_MODEL",
+            "Google/Sphinx",
+            "Usando Google Speech para transcribir",
+            
+            # Mensajes técnicos de autenticación (solo los muy técnicos)
+            "Resultado autenticacion:",
+            "ok=",
+            "confianza=",
+            "esperado=",
+            "Verificando identidad...",
+            "V Autenticacion exitosa:",
+            "Usuario en BD:",
+            "Usuario '",
+            "registrado exitosamente en la base de datos",
+            "Modelo actualizado:",
+            "Autenticacion exitosa",
+            
+            # Mensajes técnicos de enrolamiento
+            "=== INICIO ENROLAMIENTO:",
+            "Carpeta de captura:",
+            "Capturadas",
+            "/300 fotos",
+            "Enrollment registrado con id=",
+            "Se capturaron",
+            "rostros. Entrenando modelo",
+            "Iniciando entrenamiento del modelo",
+            "Procesando",
+            "Iniciando captura de 300 rostros",
+            "Captura finalizada:",
+            "Captura completada:",
+            "Registradas 300 fotos en la BD",
+            "imagenes de",
+            "Cargadas",
+            "imagenes validas de",
+            "Entrenando modelo con",
+            "rostros de",
+            "personas",
+            "Modelo guardado exitosamente en:",
+            "Modelo registrado en BD con id=",
+            "Modelo entrenado exitosamente:",
+            "=== FIN ENROLAMIENTO EXITOSO:",
+            
+            # Mensajes técnicos de OCR
+            "?? Preparando camara",
+            "Preparando camara para capturar documento",
+            "Preparando cámara para capturar documento",
+            "Preparando camara para verificar fecha de vencimiento",
+            "Preparando cámara para verificar fecha de vencimiento",
+            "No encontre texto en el documento",
+            "conf=",
+            "OCR - imagen procesada",
+            "(No responde)",
+            # Mensajes de errores/estado de audio que no deben ir al chat
+            "reconocimiento fallido (confianza",
+            "recalibrando microfono para escucharte mejor",
+            "microfono listo, intenta nuevamente",
+            "No pude leer la fecha de vencimiento",
+            "No pude leer la fecha de vencimiento con claridad",
+        ]
+        
+        # Verificar si el mensaje debe ocultarse del chat (solo roles técnicos)
+        if role not in ("app/tts", "user"):
+            norm_text = _norm(text)
+            debe_ocultar = any(_norm(filtro) in norm_text for filtro in FILTROS_OCULTAR)
+            if debe_ocultar:
+                # Solo mostrar en terminal, NO en chat
+                print(f"[TERMINAL ONLY] {text}")
+                return
+
+        # Mostrar mensajes según el rol usando método thread-safe
+        if role == "user":
+            # Normalizar nombre del asistente cuando el usuario dice "ojos"
+            if text:
+                text = (
+                    text.replace("ojos", "OJOZ")
+                        .replace("Ojos", "OJOZ")
+                        .replace("OJOS", "OJOZ")
+                )
+            # Mensaje del USUARIO (verde, derecha)
+            self._safe_add_message(text, is_user=True)
+        elif role in ("sys", "app/tts"):
+            # Mensaje del SISTEMA/TTS (azul, izquierda)
+            self._safe_add_message(text, is_user=False)
+        else:
+            # Cualquier otro rol: mostrar como sistema para no perder mensajes
+            self._safe_add_message(text, is_user=False)
+
+    def _safe_add_message(self, text: str, is_user: bool):
+        """Añadir mensaje de forma thread-safe"""
+        if not self.page:
+            return
+        
+        self._run_on_ui(lambda: self.add_message(text, is_user))
+    
+    def _on_tts_start(self, **kwargs):
+        """Indicar que el sistema está hablando con animación y ondas de sonido"""
+        if self.status_text and self.page:
+            def update():
+                self.status_text.value = "Reproduciendo..."
+                self.status_text.color = "#00f5a0"
+                # Animar el contenedor del status con efecto pulsante
+                if hasattr(self.status_text, 'parent'):
+                    self.status_text.parent.border = ft.Border.all(2, "#00f5a080")
+                    self.status_text.parent.bgcolor = "#00f5a020"
+                    self.status_text.parent.shadow = ft.BoxShadow(
+                        spread_radius=5,
+                        blur_radius=25,
+                        color="#00f5a060",
+                        offset=ft.Offset(0, 5),
+                    )
+                    self.status_text.parent.animate = ft.Animation(500, ft.AnimationCurve.EASE_IN_OUT)
+                self.page.update()
+            
+            self._run_on_ui(update)
+    
+    def _on_tts_end(self, **kwargs):
+        """Volver al estado normal con transici¢n suave"""
+        if self.status_text and self.page:
+            def update():
+                self.status_text.value = self._status_label()
+                self.status_text.color = "#ffffff"
+                # Restaurar el estilo original con animaci¢n
+                if hasattr(self.status_text, 'parent'):
+                    self.status_text.parent.border = ft.Border.all(1, "#0D1F2330")
+                    self.status_text.parent.bgcolor = "#1a1f3a80"
+                    self.status_text.parent.shadow = ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=15,
+                        color="#0D1F2320",
+                        offset=ft.Offset(0, 5),
+                    )
+                self.page.update()
+            
+            self._run_on_ui(update)
+
+    def _on_camera_start(self, **kwargs):
+        """Activar preview de cámara"""
+        self.camera_active = True
+        if self.camera_preview and self.page:
+            def update():
+                self.camera_preview.visible = True
+                self.page.update()
+            
+            self._run_on_ui(update)
+            
+            # Iniciar thread de actualización de preview
+            if not self.preview_thread or not self.preview_thread.is_alive():
+                self.preview_thread = Thread(target=self._update_camera_preview, daemon=True)
+                self.preview_thread.start()
+    
+    def _on_camera_stop(self, **kwargs):
+        """Desactivar preview de cámara"""
+        self.camera_active = False
+        if self.camera_preview and self.page:
+            def update():
+                self.camera_preview.visible = False
+                self.page.update()
+            
+            self._run_on_ui(update)
+    
+    def _update_camera_preview(self):
+        """Actualizar preview de cámara en tiempo real"""
+        cap = cv2.VideoCapture(0)
+        while self.camera_active and cap.isOpened():
+            ret, frame = cap.read()
+            if ret:
+                # Redimensionar para preview
+                frame = cv2.resize(frame, (320, 240))
+                # Convertir a base64 para mostrar en Flet
+                _, buffer = cv2.imencode('.jpg', frame)
+                img_base64 = base64.b64encode(buffer).decode()
+                
+                if self.camera_preview and self.page:
+                    def update_preview():
+                        self.camera_preview.src = f"data:image/jpeg;base64,{img_base64}"
+                        self.page.update()
+                    
+                    self._run_on_ui(update_preview)
+            time.sleep(0.1)  # 10 FPS
+        cap.release()
+    
+    def add_message(self, text, is_user=False):
+        """Agregar mensaje al chat con diseño premium y animaciones"""
+        if not self.chat_messages or not self.page:
+            return
+        
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        # Colores y estilos según el rol
+        if is_user:
+            # Mensajes del usuario: vidrio neutro semitransparente
+            text_color = "#0a0e27"
+            timestamp_color = "#0a0e2780"
+            shadow_color = "#00000030"
+            avatar_label = "Tu"
+        else:
+            # Mensajes del sistema (OJOZ): vidrio neutro con texto claro
+            text_color = "#ffffff"
+            timestamp_color = "#AFB3B7"
+            shadow_color = "#00000035"
+            avatar_label = "OJOZ"
+        
+        # Contenedor del mensaje con glassmorphism y animación
+        message_container = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Container(
+                        content=ft.Image(
+                            src="images/PerroOjoz.png",
+                            width=28,
+                            height=28,
+                            fit=ft.BoxFit.CONTAIN,
+                        ) if not is_user else ft.Text(avatar_label, size=11),
+                        bgcolor="#0D1F2340" if not is_user else "#0a0e2720",
+                        border_radius=20,
+                        padding=2,
+                        width=32,
+                        height=32,
+                        alignment=ft.Alignment.CENTER,
+                    ),
+                    ft.Text(
+                        "OJOZ" if not is_user else "Tú",
+                        size=12,
+                        color=timestamp_color,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                ], spacing=8),
+                ft.Text(
+                    text,
+                    color=text_color,
+                    size=15,
+                    weight=ft.FontWeight.W_400,
+                    selectable=True,
+                ),
+                ft.Row([
+                    ft.Text(
+                        timestamp,
+                        color=timestamp_color,
+                        size=11,
+                    ),
+                ], alignment=ft.MainAxisAlignment.END),
+            ], spacing=8),
+            gradient=None,
+            bgcolor="#0F1822BB",  # tono gris azulado semitransparente tipo glass
+            border_radius=18,
+            padding=15,
+            opacity=0,
+            animate_opacity=ft.Animation(400, ft.AnimationCurve.EASE_IN),
+            margin=ft.Margin.only(bottom=10),
+            border=None,
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=15,
+                color=shadow_color,
+                offset=ft.Offset(0, 5),
+            ),
+            animate=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
+        )
+        
+        # Alinear según quién envía
+        row = ft.Row(
+            [message_container],
+            alignment=ft.MainAxisAlignment.START if not is_user else ft.MainAxisAlignment.END,
+        )
+        
+        self.chat_messages.controls.append(row)
+        
+        # Actualizar inmediatamente para que el control aparezca en el DOM
+        try:
+            self.page.update()
+        except:
+            pass
+        
+        # Animar aparición del mensaje y forzar scroll al final del ListView.
+        # scroll_to() es una corutina en flet 0.86, por eso este handler si va
+        # con run_task() (que exige corutina) en vez de _run_on_ui().
+        async def show_message():
+            message_container.opacity = 1
+            try:
+                await self.chat_messages.scroll_to(offset=-1, duration=100)
+            except Exception as e:
+                print(f"[SCROLL ERROR] {e}")
+            try:
+                self.page.update()
+            except Exception:
+                pass
+
+        try:
+            self.page.run_task(show_message)
+        except Exception as e:
+            print(f"[UI WARNING] No se pudo animar el mensaje: {e}")
+    
+    def _on_stt_text(self, **kwargs):
+        """Mostrar en el chat lo que el usuario dijo - YA NO SE USA
+        
+        Ahora usamos ui:print con role=user para mostrar el mensaje inmediatamente
+        """
+        pass
+    
+    def build(self, page: ft.Page):
+        """Construir la interfaz ultra moderna"""
+        self.page = page
+        page.title = "OJOZ - AI Vision Assistant"
+        page.theme_mode = ft.ThemeMode.DARK
+        page.padding = 0
+        page.window.resizable = True
+        page.bgcolor = "#9CA0A5"  # Fondo azul oscuro premium
+        
+        # Configurar ventana maximizada
+        page.window.maximized = True
+        page.window.always_on_top = False
+        
+        # Header moderno con gradiente animado
+        self.header_container = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.VISIBILITY, color="#C9762E", size=40),
+                    ft.Column([
+                        ft.Text(
+                            "OJOZ - Perro Guía",
+                            size=42,
+                            weight=ft.FontWeight.W_900,
+                            color="#F28D35",
+                            font_family="Segoe UI",
+                            text_align=ft.TextAlign.CENTER,
+                            style=ft.TextStyle(
+                                letter_spacing=2,
+                            ),
+                        ),
+                        ft.Text(
+                            "Asistente de Visión Artificial",
+                            size=14,
+                            color="#D3833C",
+                            weight=ft.FontWeight.W_500,
+                            font_family="Segoe UI",
+                            text_align=ft.TextAlign.CENTER,
+                            italic=True,
+                            style=ft.TextStyle(
+                                letter_spacing=1,
+                            ),
+                        ),
+                    ], spacing=0),
+                ], alignment=ft.MainAxisAlignment.CENTER, spacing=15),
+            ]),
+            # Fondo liso semi-transparente (sin degradado)
+            bgcolor="#132E3580",
+            padding=ft.Padding.only(left=20, right=20, top=15, bottom=12),
+            # Esquinas simétricas (arriba y abajo)
+            border_radius=ft.BorderRadius.all(25),
+            # Separar el header de los bordes de la ventana
+            margin=ft.Margin.only(left=10, right=10, top=10),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=30,
+                color="#00000080",
+                offset=ft.Offset(0, 10),
+            ),
+            animate=ft.Animation(1000, ft.AnimationCurve.EASE_IN_OUT),
+        )
+        
+        # Franja sin animación de gradiente (estática)
+        self.animate_header = False
+        
+        header = self.header_container
+        
+        # Funciones disponibles en horizontal con indicador de usuario
+        self.status_text = ft.Text(
+            self._status_label(),
+            size=14,
+            color="#ffffff",
+            weight=ft.FontWeight.W_500,
+        )
+        
+        status_bar = ft.Container(
+            content=ft.Row([
+                # Funciones horizontales
+                ft.Container(
+                    content=ft.Row([
+                        ft.Text(
+                            "Funciones Disponibles",
+                            size=16,
+                            color="#ffffff",
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                        self._create_compact_option("1", "Leer\nDocumento", ft.Icons.DESCRIPTION, "#0D1F23"),
+                        self._create_compact_option("2", "Identificar\nDinero", ft.Icons.PAYMENTS, "#0D1F23"),
+                        self._create_compact_option("3", "Verificar\nVencimiento", ft.Icons.EVENT, "#0D1F23"),
+                    ], spacing=15, alignment=ft.MainAxisAlignment.START),
+                    expand=True,
+                ),
+                # Indicador de usuario
+                ft.Container(
+                    content=self.status_text,
+                    bgcolor="#1a1f3a80",
+                    border_radius=20,
+                    padding=ft.Padding.symmetric(horizontal=20, vertical=10),
+                    border=ft.Border.all(1, "#0D1F2330"),
+                    shadow=ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=15,
+                        color="#0D1F2320",
+                        offset=ft.Offset(0, 5),
+                    ),
+                ),
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            bgcolor="transparent",
+            padding=15,
+        )
+        
+        # Chat messages con scroll automático - mensajes nuevos siempre visibles abajo
+        self.chat_messages = ft.ListView(
+            spacing=12,
+            padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
+            auto_scroll=True,  # Auto-scroll al agregar nuevos mensajes
+            expand=True,
+        )
+        
+        chat_container = ft.Container(
+            content=self.chat_messages,
+            bgcolor="transparent",
+            expand=True,
+        )
+        
+        # Camera preview con diseño moderno (inicialmente oculto)
+        self.camera_preview = ft.Image(
+            src="",
+            width=340,
+            height=255,
+            fit=ft.BoxFit.COVER,
+            visible=False,
+            border_radius=20,
+        )
+        
+        camera_container = ft.Container(
+            content=ft.Column([
+                ft.Container(
+                    content=ft.Row([
+                        ft.Container(
+                            content=ft.Icon(ft.Icons.FIBER_MANUAL_RECORD, color="#ff6b6b", size=12),
+                            animate_opacity=ft.Animation(800, ft.AnimationCurve.EASE_IN_OUT),
+                        ),
+                        ft.Icon(ft.Icons.CAMERA_ALT, color="#ff6b6b", size=20),
+                        ft.Text(
+                            "Vista en Vivo",
+                            size=15,
+                            color="#ffffff",
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                    ], spacing=8),
+                    bgcolor="#1a1f3a80",
+                    border_radius=15,
+                    padding=10,
+                    border=ft.Border.all(1, "#ff6b6b30"),
+                    shadow=ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=15,
+                        color="#ff6b6b40",
+                        offset=ft.Offset(0, 3),
+                    ),
+                ),
+                ft.Container(
+                    content=self.camera_preview,
+                    bgcolor="#000000",
+                    border_radius=20,
+                    border=ft.Border.all(2, "#ff6b6b40"),
+                    shadow=ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=20,
+                        color="#ff6b6b30",
+                        offset=ft.Offset(0, 5),
+                    ),
+                    animate_scale=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
+                ),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=10),
+            bgcolor="transparent",
+            padding=15,
+            visible=False,  # Oculto por defecto hasta que se active la cámara
+        )
+        
+
+        
+        # Carta de presentación de OJOZ con imagen del personaje y globo de diálogo
+        presentation_card = ft.Container(
+            content=ft.Row([
+                # Imagen del personaje OJOZ con fondo transparente
+                ft.Container(
+                    content=ft.Image(
+                        src="images/PerroOjoz.png",
+                        width=360,
+                        height=360,
+                        fit=ft.BoxFit.CONTAIN,
+                    ),
+                    bgcolor="transparent",
+                    padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
+                    margin=ft.Margin.only(left=20, right=20, top=0, bottom=20),
+                    border_radius=ft.BorderRadius.all(30),
+                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                    shadow=ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=35,
+                        color="#0D1F2320",
+                        offset=ft.Offset(0, 10),
+                    ),
+                ),
+                # Globo de diálogo con forma de burbuja de chat y triángulo
+                ft.Stack([
+                    # Triángulo apuntando hacia OJOZ (pico del globo) - simulado con Container rotado
+                    ft.Container(
+                        width=20,
+                        height=20,
+                        gradient=ft.LinearGradient(
+                            begin=ft.Alignment.TOP_LEFT,
+                            end=ft.Alignment.BOTTOM_RIGHT,
+                            colors=["#1a1f3a", "#0f1729"],
+                        ),
+                        border=ft.Border.only(
+                            top=ft.BorderSide(3, "#0D1F23"),
+                            left=ft.BorderSide(3, "#0D1F23"),
+                        ),
+                        rotate=ft.Rotate(angle=-0.785398),  # -45 grados en radianes
+                        left=-10,
+                        top=50,
+                    ),
+                    # Contenido del globo
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Text(
+                                "¡Hola! Soy OJOZ",
+                                size=28,
+                                weight=ft.FontWeight.BOLD,
+                                color="#8C311C",
+                            ),
+                            ft.Container(height=10),
+                            ft.Text(
+                                "Tu asistente de visión artificial",
+                                size=18,
+                                color="#F2B33D",
+                                weight=ft.FontWeight.W_500,
+                                italic=True,
+                            ),
+                            ft.Container(height=15),
+                            ft.Text(
+                                "Estoy aquí para ayudarte con:",
+                                size=16,
+                                color="#F2D43D",
+                                weight=ft.FontWeight.W_600,
+                            ),
+                            ft.Container(height=10),
+                            ft.Column([
+                                ft.Row([
+                                    ft.Icon(ft.Icons.DESCRIPTION, color="#F2B33D", size=20),
+                                    ft.Text("Lectura de documentos mediante OCR", size=14, color="#ffffff"),
+                                ], spacing=10),
+                                ft.Row([
+                                    ft.Icon(ft.Icons.PAYMENTS, color="#F2B33D", size=20),
+                                    ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff"),
+                                ], spacing=10),
+                                ft.Row([
+                                    ft.Icon(ft.Icons.EVENT, color="#F2B33D", size=20),
+                                    ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff"),
+                                ], spacing=10),
+                            ], spacing=8),
+                            ft.Container(height=15),
+                            ft.Row([
+                                ft.Text(
+                                    "Habla cuando termine de presentarme para comenzar",
+                                    size=13,
+                                    color="#F2B33D",
+                                    weight=ft.FontWeight.W_500,
+                                ),
+                            ], spacing=8),
+                        ], spacing=0),
+                        bgcolor="transparent",
+                        border_radius=25,
+                        padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
+                    ),
+                ], expand=False),
+            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=10),
+            bgcolor="#132E3565",
+            padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
+            margin=ft.Margin.only(left=20, right=20, top=0, bottom=20),
+            border_radius=ft.BorderRadius.all(30),
+            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=35,
+                color="#0D1F2320",
+                offset=ft.Offset(0, 10),
+            ),
+        )
+        
+        # Agregar la carta de presentación al chat
+        if self.chat_messages:
+            self.chat_messages.controls.append(presentation_card)
+            # Actualizar para que aparezca la carta
+            try:
+                page.update()
+            except:
+                pass
+        
+        # Layout principal con degradado de fondo (solo los 3 colores solicitados)
+        main_container = ft.Container(
+            content=ft.Column([
+                header,
+                status_bar,
+                chat_container,  # Ya tiene expand=True dentro
+                camera_container,
+            ], spacing=0, expand=True),
+            gradient=ft.LinearGradient(
+                begin=ft.Alignment.TOP_LEFT,
+                end=ft.Alignment.BOTTOM_RIGHT,
+                colors=["#0B1220", "#011126", "#8C311C"],
+                stops=[0.0, 0.6, 1.0],
+            ),
+            expand=True,
+        )
+        
+        page.add(main_container)
+        
+        # Forzar actualización y maximizar después de agregar contenido
+        page.update()
+    
+    def _create_compact_option(self, number, title, icon, color):
+        """Crear opción compacta horizontal con diseño moderno"""
+        return ft.Container(
+            content=ft.Row([
+                ft.Container(
+                    content=ft.Text(
+                        number,
+                        size=18,
+                        color=color,
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    bgcolor="#F28D35",
+                    border_radius=30,
+                    width=36,
+                    height=36,
+                    alignment=ft.Alignment.CENTER,
+                    border=ft.Border.all(1, "#0D1F2340"),
+                    shadow=ft.BoxShadow(
+                        spread_radius=0,
+                        blur_radius=8,
+                        color="#0D1F2325",
+                        offset=ft.Offset(0, 2),
+                    ),
+                ),
+                # `color` es el del numero dentro del circulo naranja; sobre el
+                # fondo oscuro del header hace falta el tono claro de acento.
+                ft.Icon(icon, color="#F28D35", size=22),
+                ft.Text(
+                    title.replace("\n", " "),
+                    size=11,
+                    color="#ffffff",
+                    weight=ft.FontWeight.W_500,
+                    no_wrap=False,
+                ),
+            ], spacing=6, alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bgcolor="#1a1f3a80",
+            border_radius=15,
+            padding=8,
+            border=ft.Border.all(1, "#0D1F2320"),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=10,
+                color="#0D1F2315",
+                offset=ft.Offset(0, 3),
+            ),
+        )
+    
+    def _create_option_card(self, number, title, icon, color):
+        """Crear tarjeta de opción con diseño moderno y hover effect"""
+        card_content = ft.Column([
+            ft.Container(
+                content=ft.Text(
+                    number,
+                    size=28,
+                    color=color,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                bgcolor="#1a1f3a",
+                border_radius=50,
+                width=50,
+                height=50,
+                alignment=ft.Alignment.CENTER,
+                border=ft.Border.all(2, color + "40"),
+                shadow=ft.BoxShadow(
+                    spread_radius=0,
+                    blur_radius=15,
+                    color=color + "30",
+                    offset=ft.Offset(0, 5),
+                ),
+                animate_scale=ft.Animation(300, ft.AnimationCurve.EASE_OUT),
+            ),
+            ft.Icon(icon, color=color, size=30),
+            ft.Text(
+                title,
+                size=11,
+                color="#ffffff",
+                weight=ft.FontWeight.W_500,
+                text_align=ft.TextAlign.CENTER,
+            ),
+        ], spacing=8, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+        
+        return ft.Container(
+            content=card_content,
+            bgcolor="#1a1f3a80",
+            border_radius=20,
+            padding=15,
+            width=110,
+            border=ft.Border.all(1, color + "30"),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=20,
+                color=color + "20",
+                offset=ft.Offset(0, 8),
+            ),
+            animate_scale=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
+        )
+
+
+# El punto de entrada real de la aplicacion es app/main_flet.py, que construye
+# el Controller con sus dependencias (TTS/STT) y lo enlaza con esta vista.
+
+
+
+
+
+
+
+
+
+
+
+
+
