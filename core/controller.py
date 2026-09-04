@@ -25,6 +25,7 @@ from app.vision.currency import detect_currency_best_frame
 from app.vision.expiry import check_expiry_best_frame
 
 from app.core.router import infer_intent
+from app.core.llm_agent import LLMAgent
 
 State = Literal["IDLE", "TTS_SPEAKING", "LISTENING", "PROCESSING"]
 
@@ -63,12 +64,129 @@ class Controller:
         self._pending_expiry_after_tts: bool = False
         self._expiry_capture_seconds: float | None = None
 
+        # Opción B: conversación conducida por un modelo de lenguaje. Si está
+        # desactivada o no puede atender, se usa el flujo por palabras clave.
+        self._llm = LLMAgent(
+            actions=self._build_llm_actions(),
+            speak=self.speak,
+            estado=self._llm_estado,
+        )
+        self._llm_reset_pending = False
+
         self._register_events()
 
         # Watchdog: si por algún driver no llega tts:end, reactivamos STT
         self._watch_stop = threading.Event()
         self._watcher = threading.Thread(target=self._watchdog_loop, daemon=True)
         self._watcher.start()
+
+    # -----------------------------
+    # Acciones disponibles para el modelo (opción B)
+    # -----------------------------
+    def _llm_estado(self) -> str:
+        """Resume para el modelo en qué punto está la sesión."""
+        if self._authenticated and self._user_name:
+            return f"{self._user_name} tiene la identidad verificada y puede usar todas las funciones."
+        return "Nadie ha iniciado sesión todavía. Primero hay que registrarse o verificar identidad."
+
+    def _build_llm_actions(self) -> dict:
+        """
+        Funciones reales que el modelo puede pedir que se ejecuten.
+
+        Cada una comprueba por su cuenta si la sesión está iniciada: es el código
+        el que concede o niega el acceso, nunca el modelo. Antes de abrir la
+        cámara se espera a que termine de hablar, para que la persona escuche la
+        indicación antes de que empiece la captura.
+        """
+
+        def _sesion_iniciada() -> str | None:
+            if not (self._authenticated and self._user_name):
+                return (
+                    "La persona todavía no tiene la identidad verificada, así que no "
+                    "se ejecutó nada. Ofrécele registrarse o verificar su identidad."
+                )
+            return None
+
+        def _segundos_validos(segundos) -> float:
+            try:
+                return float(max(5, min(int(segundos), 60)))
+            except (TypeError, ValueError):
+                return 10.0
+
+        def registrar_usuario(nombre: str) -> str:
+            nombre = self._extract_name(nombre) or nombre
+            if not nombre:
+                return "No se entendió el nombre. Pídeselo de nuevo."
+            if dao.user_exists(nombre):
+                return f"{nombre} ya tiene una cuenta; usa autenticar_usuario para verificar su identidad."
+            self.tts.join()
+            return self._enroll_workflow(nombre, llm_mode=True)
+
+        def autenticar_usuario(nombre: str) -> str:
+            nombre = self._extract_name(nombre) or nombre
+            if not nombre:
+                return "No se entendió el nombre. Pídeselo de nuevo."
+            if not dao.user_exists(nombre):
+                return f"No hay ninguna cuenta a nombre de {nombre}. Ofrécele registrarse."
+            self._user_name = nombre
+            self.tts.join()
+            return self._auth_workflow(llm_mode=True)
+
+        def leer_documento(segundos: int = 10) -> str:
+            if (error := _sesion_iniciada()) is not None:
+                return error
+            self.tts.join()
+            return self._ocr_workflow(capture_seconds=_segundos_validos(segundos), llm_mode=True)
+
+        def identificar_dinero() -> str:
+            if (error := _sesion_iniciada()) is not None:
+                return error
+            self.tts.join()
+            return self._currency_workflow(llm_mode=True)
+
+        def verificar_vencimiento(segundos: int = 10) -> str:
+            if (error := _sesion_iniciada()) is not None:
+                return error
+            self.tts.join()
+            return self._expiry_workflow(capture_seconds=_segundos_validos(segundos), llm_mode=True)
+
+        def describir_escena() -> str:
+            if (error := _sesion_iniciada()) is not None:
+                return error
+            # El enlace se enuncia literal, sin pasar por el modelo.
+            self.speak("Entra al siguiente link https://ojoz-tts-820628120958.southamerica-west1.run.app")
+            return "Se le dictó el enlace del servicio de descripción."
+
+        def cerrar_sesion() -> str:
+            nombre = self._user_name or "la persona"
+            self._user_name = None
+            self._authenticated = False
+            self._conversation_state = None
+            # El historial se limpia al terminar el turno, no en mitad de él.
+            self._llm_reset_pending = True
+            return f"Sesión de {nombre} cerrada. Despídete brevemente."
+
+        def cerrar_aplicacion() -> str:
+            event_bus.publish("app:shutdown")
+
+            def _apagar():
+                self.tts.join()
+                self.stt.stop()
+                self.tts.shutdown()
+
+            threading.Thread(target=_apagar, daemon=True).start()
+            return "La aplicación se está cerrando. Despídete en una frase."
+
+        return {
+            "registrar_usuario": registrar_usuario,
+            "autenticar_usuario": autenticar_usuario,
+            "leer_documento": leer_documento,
+            "identificar_dinero": identificar_dinero,
+            "verificar_vencimiento": verificar_vencimiento,
+            "describir_escena": describir_escena,
+            "cerrar_sesion": cerrar_sesion,
+            "cerrar_aplicacion": cerrar_aplicacion,
+        }
 
     # -----------------------------
     # Setup de eventos
@@ -367,9 +485,21 @@ class Controller:
         self.stt.enable_listening(False)
         self._set_state("PROCESSING")
 
+        # Opción B: si la conversación por modelo está activa, atiende ella el
+        # turno. Si no está disponible o falla, se sigue con el flujo de siempre.
+        if self._llm.is_available():
+            respuesta = self._llm.handle(text)
+            if self._llm_reset_pending:
+                self._llm.reset()
+                self._llm_reset_pending = False
+            if respuesta:
+                self.speak(respuesta)
+                return
+
         # Verificar si estamos en un flujo de conversación específico
         reply = None
-        
+
+
         if self._conversation_state == "waiting_new_user_name":
             lower = (text or "").lower()
             if self._is_existing_user_utterance(lower):
@@ -759,11 +889,17 @@ class Controller:
     # =============================
     # NUEVOS WORKFLOWS (visión)
     # =============================
-    def _enroll_workflow(self, name: str):
-        """Captura N fotos del usuario y reentrena el modelo LBPH."""
+    def _enroll_workflow(self, name: str, llm_mode: bool = False) -> str:
+        """
+        Captura N fotos del usuario y reentrena el modelo LBPH.
+
+        En `llm_mode` no encadena los mensajes de bienvenida (los da el modelo) y
+        devuelve un resumen. El alta de la sesión la marca este código, no el modelo.
+        """
         from app.utils.logger import logger
         from pathlib import Path
-        
+
+
         try:
             # Bloquear escucha durante enrolamiento
             self.stt.enable_listening(False)
@@ -813,12 +949,22 @@ class Controller:
             logger.info(f"Modelo registrado en BD con id={model_id}")
 
             event_bus.publish("camera.closed", index=vision.camera_index)
-            # Confirmar por voz
-            self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
+            if not llm_mode:
+                # Confirmar por voz
+                self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
             event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
             event_bus.publish("ui:print", role="sys", text=f"[OK] Modelo actualizado: {model_path}")
             logger.info(f"=== FIN ENROLAMIENTO EXITOSO: {name} ===")
-            
+
+            if llm_mode:
+                # La sesión se marca aquí, en el código: el modelo no decide quién
+                # está autenticado.
+                self._user_name = name
+                self._authenticated = True
+                self._conversation_state = None
+                return f"Cuenta creada para {name}, que ya queda identificado con {saved} fotos."
+
+
             # Continuar el flujo sin regresar al saludo inicial
             def _continue_after_enroll():
                 time.sleep(1.5)  # Esperar un poco después del mensaje de confirmación
@@ -833,16 +979,26 @@ class Controller:
             
         except Exception as e:
             logger.error(f"Error en enrolamiento: {e}", exc_info=True)
-            self.speak("Hubo un problema durante el registro. Intente nuevamente.")
             event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+            if llm_mode:
+                return f"El registro falló: {e}"
+            self.speak("Hubo un problema durante el registro. Intente nuevamente.")
         finally:
             # La reactivación de STT se hará tras tts:end del mensaje final
             pass
+        return ""
 
-    def _auth_workflow(self):
-        """Reconocimiento facial (LBPH) durante unos segundos y saluda si se reconoce."""
+    def _auth_workflow(self, llm_mode: bool = False) -> str:
+        """
+        Reconocimiento facial (LBPH) durante unos segundos y saluda si se reconoce.
+
+        En `llm_mode` devuelve el veredicto en lugar de conducir la conversación.
+        Quien decide si la identidad es válida es el reconocimiento facial: el
+        modelo solo recibe el resultado y nunca puede alterar `_authenticated`.
+        """
         from app.utils.logger import logger
-        
+
+
         try:
             # Bloquear escucha durante autenticación
             self.stt.enable_listening(False)
@@ -860,20 +1016,35 @@ class Controller:
                 if self._user_name and recognized_name.lower() == self._user_name.lower():
                     # El nombre coincide con el esperado
                     self._authenticated = True  # Marcar como autenticado
-                    self.speak(f"Un gusto conocerte, {self._user_name}. ¿En qué puedo ayudarte?")
                     event_bus.publish("ui:print", role="sys", text=f"[OK] Autenticación exitosa: {self._user_name}")
+                    if llm_mode:
+                        return f"Identidad verificada: es {self._user_name}. Ya puede usar las funciones."
+                    self.speak(f"Un gusto conocerte, {self._user_name}. ¿En qué puedo ayudarte?")
                 else:
                     # Se reconoció pero NO es la persona esperada
                     self._authenticated = False
-                    self._conversation_state = "waiting_returning_user_name"  # Volver a pedir nombre
-                    self.speak(f"Tu no eres {self._user_name}, por favor digame correctamente su nombre.")
                     # Solo registrar en logs; no mostrar mensaje técnico en el chat de la interfaz
                     logger.warning(f"Usuario reconocido como '{recognized_name}' pero se esperaba '{self._user_name}'")
+                    esperado = self._user_name
                     self._user_name = None
+                    if llm_mode:
+                        return (
+                            f"El rostro no coincide con {esperado}. No se concede acceso; "
+                            "pide el nombre correcto o propón registrarse."
+                        )
+                    self._conversation_state = "waiting_returning_user_name"  # Volver a pedir nombre
+                    self.speak(f"Tu no eres {esperado}, por favor digame correctamente su nombre.")
             else:
                 # No se pudo reconocer con suficiente confianza
                 self._authenticated = False
-                
+                event_bus.publish("ui:print", role="sys", text=f"[FALLO] Reconocimiento fallido (confianza: {conf})")
+                self._user_name = None
+
+                if llm_mode:
+                    if conf is None:
+                        return "No se detectó ningún rostro. Sugiere acomodarse frente a la cámara o registrarse."
+                    return "No se reconoció el rostro con suficiente certeza. No se concede acceso."
+
                 if conf is None:
                     # No se detectó ningún rostro - ofrecer registro
                     msg = "No detectó ningun rostro ¿Desea registraste?"
@@ -882,27 +1053,34 @@ class Controller:
                     # Baja confianza - volver a pedir nombre
                     msg = "No se pudo reconocer de forma satisfactoria. Por favor digame su nombre de nuevo."
                     self._conversation_state = "waiting_returning_user_name"  # Volver a pedir nombre
-                
+
                 self.speak(msg)
-                event_bus.publish("ui:print", role="sys", text=f"[FALLO] Reconocimiento fallido (confianza: {conf})")
-                self._user_name = None
 
         except FileNotFoundError:
             # Modelo inexistente
-            self.speak("Aun no hay modelo de reconocimiento. Por favor registrese primero con la opcion uno.")
             event_bus.publish("ui:print", role="sys", text="[FALLO] Modelo de reconocimiento no encontrado")
+            if llm_mode:
+                return "Todavía no hay ningún usuario registrado, así que no se puede verificar identidad."
+            self.speak("Aun no hay modelo de reconocimiento. Por favor registrese primero con la opcion uno.")
         except Exception as e:
             logger.error(f"Error en autenticación: {e}", exc_info=True)
-            self.speak("Ocurrio un error durante la autenticacion.")
             event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+            if llm_mode:
+                return f"La verificación falló: {e}"
+            self.speak("Ocurrio un error durante la autenticacion.")
         finally:
             # La reactivación de STT se hará tras tts:end del mensaje final
             pass
+        return ""
 
     # ======== NUEVO: OCR (Opción 1) ========
-    def _ocr_workflow(self):
+    def _ocr_workflow(self, capture_seconds: float | None = None, llm_mode: bool = False) -> str:
         """
         Captura durante unos segundos, realiza OCR (Tesseract) y lee en voz alta el texto.
+
+        En `llm_mode` no enuncia el aviso inicial (ya lo dijo el modelo) ni encadena
+        preguntas de seguimiento, y devuelve un resumen del resultado. El texto del
+        documento se lee siempre literal, nunca reformulado.
         """
         from app.utils.logger import logger
 
@@ -918,10 +1096,11 @@ class Controller:
             self.stt.enable_listening(False)
             event_bus.publish("ui:print", role="sys", text="Preparando cámara para capturar documento...")
 
-            capture_seconds = self._ocr_capture_seconds or 10.0
+            capture_seconds = capture_seconds or self._ocr_capture_seconds or 10.0
             self._ocr_capture_seconds = None
-            self.speak(f"Muestre el documento frente a la camara. La captura se realizara en {int(capture_seconds)} segundos.")
-            
+            if not llm_mode:
+                self.speak(f"Muestre el documento frente a la camara. La captura se realizara en {int(capture_seconds)} segundos.")
+
             # Capturar foto y procesar (ventana configurable para enfocar)
             ok, text, conf = read_text_best_frame(seconds=capture_seconds, lang='spa')
 
@@ -945,6 +1124,9 @@ class Controller:
                 word_count = len(text.split())
                 self.speak(f"He detectado {word_count} palabras. Leyendo contenido:")
                 self.speak(spoken)
+
+                if llm_mode:
+                    return f"Documento leído: {word_count} palabras. Ya se le leyó el texto a la persona."
             else:
                 try:
                     if sid is not None:
@@ -952,26 +1134,34 @@ class Controller:
                 except Exception:
                     pass
                 event_bus.publish("ui:print", role="sys", text="[FALLO] No encontré texto en el documento")
+                if llm_mode:
+                    return "No se encontró texto legible en el documento."
                 self._conversation_state = "waiting_ocr_more_time"
                 self.speak("No encontré texto que leer. ¿Necesitas más tiempo?")
         except Exception as e:
             logger.error(f"Error en OCR: {e}", exc_info=True)
             event_bus.publish("ui:print", role="sys", text=f"[ERROR OCR] {e}")
-            self.speak("Ocurrio un error leyendo el texto.")
             try:
                 if sid is not None:
                     dao.finish_session(sid, ok=False, details=repr(e))
             except Exception:
                 pass
+            if llm_mode:
+                return f"La lectura falló: {e}"
+            self.speak("Ocurrio un error leyendo el texto.")
         finally:
             # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
             pass
+        return ""
 
     # ======== NUEVO: CURRENCY (Opción 2) ========
-    def _currency_workflow(self):
+    def _currency_workflow(self, llm_mode: bool = False) -> str:
         """
         Detecta el valor de billetes (10, 20, 50, 100, 200 soles) o monedas.
         Usa OCR en región central del billete para leer el número grande.
+
+        En `llm_mode` omite el aviso inicial y devuelve un resumen del resultado.
+        El valor detectado se enuncia siempre tal cual lo devuelve la detección.
         """
         from app.utils.logger import logger
 
@@ -986,8 +1176,10 @@ class Controller:
             # Bloquear escucha durante la detección
             self.stt.enable_listening(False)
             event_bus.publish("ui:print", role="sys", text="Preparando cámara, por favor mantenga quieto el billete...")
-            self.speak("Muestre el billete o moneda a la camara. Tendra 15 segundos para posicionar el billete.")
-            
+            if not llm_mode:
+                self.speak("Muestre el billete o moneda a la camara. Tendra 15 segundos para posicionar el billete.")
+
+
             # Detectar dinero (15 segundos de captura para mejor posicionamiento)
             ok, curr, value, conf = detect_currency_best_frame(seconds=15.0)
 
@@ -1018,7 +1210,9 @@ class Controller:
                 conf_str = f" (conf={conf:.1f}%)" if conf is not None else ""
                 event_bus.publish("ui:print", role="sys", text=f"[OK] Detectado: {curr} {value_str}{conf_str}")
                 event_bus.publish("ui:print", role="app/currency", text=f"Valor: {value_str} {moneda_natural}")
-                
+
+                if llm_mode:
+                    return f"Detectado: {value_str} {moneda_natural}. Ya se le comunicó a la persona."
             else:
                 try:
                     if sid is not None:
@@ -1027,26 +1221,34 @@ class Controller:
                     pass
                 
                 event_bus.publish("ui:print", role="sys", text="[FALLO] No pude detectar el valor del dinero")
+                if llm_mode:
+                    return "No se pudo determinar el valor. Conviene más luz o acercar el billete."
                 self.speak("No pude determinar el valor de ese dinero. Intente con mejor iluminacion o acercando mas el billete a la camara.")
-                
+
         except Exception as e:
             logger.error(f"Error en currency workflow: {e}", exc_info=True)
             event_bus.publish("ui:print", role="sys", text=f"[ERROR CURRENCY] {e}")
-            self.speak("Ocurrio un error al identificar el dinero.")
             try:
                 if sid is not None:
                     dao.finish_session(sid, ok=False, details=repr(e))
             except Exception:
                 pass
+            if llm_mode:
+                return f"La identificación falló: {e}"
+            self.speak("Ocurrio un error al identificar el dinero.")
         finally:
             # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
             pass
+        return ""
 
     # ======== NUEVO: EXPIRY (Opción 3) ========
-    def _expiry_workflow(self, capture_seconds: float = 10.0):
+    def _expiry_workflow(self, capture_seconds: float = 10.0, llm_mode: bool = False) -> str:
         """
         Lee la fecha de vencimiento y determina si el producto está vencido.
         Busca palabras clave como "vencimiento", "caducidad", "exp", etc.
+
+        En `llm_mode` omite el aviso inicial y devuelve un resumen del resultado.
+        La fecha y el estado se enuncian siempre tal cual los devuelve la verificación.
         """
         from app.utils.logger import logger
 
@@ -1061,8 +1263,10 @@ class Controller:
             # Bloquear escucha durante la detección
             self.stt.enable_listening(False)
             event_bus.publish("ui:print", role="sys", text="Preparando cámara para verificar fecha de vencimiento...")
-            self.speak("Muestre la fecha de vencimiento del producto a la camara. La verificacion comenzara ahora.")
-            
+            if not llm_mode:
+                self.speak("Muestre la fecha de vencimiento del producto a la camara. La verificacion comenzara ahora.")
+
+
             # Verificar vencimiento con ventana configurable
             ok, date_text, is_expired, conf = check_expiry_best_frame(seconds=capture_seconds)
 
@@ -1096,7 +1300,10 @@ class Controller:
                 event_bus.publish("ui:print", role="sys", text=detalle)
                 
                 event_bus.publish("ui:print", role="app/expiry", text=f"Fecha: {date_text} - Estado: {'VENCIDO' if is_expired else 'VIGENTE'}")
-                
+
+                if llm_mode:
+                    estado = "vencido" if is_expired else "vigente"
+                    return f"Fecha {date_text}, producto {estado}. Ya se le comunicó a la persona."
             else:
                 try:
                     if sid is not None:
@@ -1105,20 +1312,24 @@ class Controller:
                     pass
                 
                 event_bus.publish("ui:print", role="sys", text="[FALLO] No pude leer la fecha de vencimiento")
+                if llm_mode:
+                    return "No se pudo leer la fecha de vencimiento con claridad."
                 self._conversation_state = "waiting_expiry_more_time"
                 self._expiry_capture_seconds = None
                 self.speak("No pude leer la fecha de vencimiento con claridad. ¿Deseas más tiempo?")
-                
+
         except Exception as e:
             logger.error(f"Error en expiry workflow: {e}", exc_info=True)
             event_bus.publish("ui:print", role="sys", text=f"[ERROR EXPIRY] {e}")
-            self.speak("Ocurrio un error al verificar la fecha de vencimiento.")
             try:
                 if sid is not None:
                     dao.finish_session(sid, ok=False, details=repr(e))
             except Exception:
                 pass
+            if llm_mode:
+                return f"La verificación falló: {e}"
+            self.speak("Ocurrio un error al verificar la fecha de vencimiento.")
         finally:
             # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
             pass
-            pass
+        return ""

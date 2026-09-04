@@ -6,6 +6,7 @@ import time
 import traceback
 import speech_recognition as sr
 
+from app.audio.denoise import TARGET_SAMPLE_RATE, denoiser
 from app.config.settings import stt as stt_config
 from app.core.event_bus import event_bus
 from app.utils.logger import logger
@@ -64,8 +65,16 @@ class STT:
         self._strict_device_lock = bool(getattr(stt_config, "strict_device_lock", True))
         self._snr_min_ratio = max(1.5, float(getattr(stt_config, "snr_min_ratio", 3.0) or 3.0))
         self._min_rms = float(getattr(stt_config, "min_rms", 15.0) or 15.0)
+        self._max_energy_threshold = float(getattr(stt_config, "max_energy_threshold", 0.0) or 0.0)
+        self._max_required_rms = float(getattr(stt_config, "max_required_rms", 3500.0) or 3500.0)
         self._noise_floor_rms: float | None = None
+        self._base_energy_threshold: float | None = None
         self._apply_energy_boost()
+
+        # Recalibración periódica del ruido ambiente.
+        self._recalibrate_cooldown_s = float(getattr(stt_config, "recalibrate_cooldown_s", 20.0) or 0.0)
+        self._recalibrate_every_s = float(getattr(stt_config, "recalibrate_every_s", 180.0) or 0.0)
+        self._last_recalibration = 0.0
 
         self._running = threading.Event()
         self._listen_enabled = threading.Event()
@@ -85,6 +94,13 @@ class STT:
         self._running.set()
         if not self._calibrated:
             self._calibrate_microphone()
+
+        # El modelo de supresión de ruido se carga en paralelo para no demorar
+        # el saludo inicial. Si aún no está listo cuando llegue la primera
+        # frase, esa frase se transcribe sin filtrar.
+        if getattr(stt_config, "denoise_enabled", False):
+            threading.Thread(target=denoiser.warmup, daemon=True).start()
+
         if not self._thread.is_alive():
             self._thread.start()
 
@@ -121,8 +137,10 @@ class STT:
                 try:
                     with sr.Microphone(device_index=device_idx) as source:
                         self._rec.adjust_for_ambient_noise(source, duration=self._calibration_duration)
-                    self._apply_energy_boost()
-                    self._capture_noise_floor()
+                        measured = self._measure_ambient_rms(source, duration=0.6)
+                    self._apply_energy_boost(measured)
+                    self._update_noise_floor(measured)
+                    self._last_recalibration = time.monotonic()
                     self._device_index = device_idx
                     try:
                         names = sr.Microphone.list_microphone_names() or []
@@ -153,37 +171,108 @@ class STT:
     def _quick_calibrate(self, source: sr.Microphone) -> None:
         try:
             self._rec.adjust_for_ambient_noise(source, duration=0.25)
-            self._apply_energy_boost()
-            self._capture_noise_floor()
+            measured = self._measure_ambient_rms(source, duration=0.25)
+            self._apply_energy_boost(measured)
+            self._update_noise_floor(measured)
         except Exception:
             pass
 
-    def _apply_energy_boost(self) -> None:
+    def _apply_energy_boost(self, ambient_rms: float | None = None) -> None:
+        """
+        Fija el umbral de energía a partir del ruido ambiente medido.
+
+        El umbral se recalcula siempre desde la medición, nunca desde su propio
+        valor anterior: multiplicarlo por el boost en cada calibración lo iba
+        desplazando turno a turno (al alza con boost mayor que 1, hacia cero con
+        boost menor que 1) hasta dejar de representar el entorno real.
+        """
         try:
-            base = getattr(self._rec, "energy_threshold", None)
-            if base is None or base <= 0:
+            if ambient_rms is not None and ambient_rms > 0:
+                # Mismo margen sobre el ruido que aplica speech_recognition.
+                margen = float(getattr(self._rec, "dynamic_energy_ratio", 1.5) or 1.5)
+                base = ambient_rms * margen
+            elif self._base_energy_threshold:
+                base = self._base_energy_threshold
+            else:
+                base = float(getattr(self._rec, "energy_threshold", 0.0) or 0.0)
+
+            if base <= 0:
                 return
+
+            self._base_energy_threshold = base
             target = base * self._energy_boost
             if self._min_energy_threshold:
                 target = max(self._min_energy_threshold, target)
-            if abs(target - base) < 1e-3:
+            if self._max_energy_threshold:
+                # Un ruido puntual muy fuerte no debe dejar el umbral tan alto
+                # que el asistente deje de oír durante el resto de la sesión.
+                target = min(self._max_energy_threshold, target)
+
+            if abs(target - float(getattr(self._rec, "energy_threshold", 0.0) or 0.0)) < 1e-3:
                 return
             logger.debug(f"Ajustando energy_threshold de {self._rec.energy_threshold} a {target}")
             self._rec.energy_threshold = target
         except Exception as exc:
             logger.debug(f"No se pudo ajustar energy_threshold: {exc}")
 
+    def _measure_ambient_rms(self, source: sr.Microphone, duration: float = 0.5) -> float | None:
+        """
+        Mide el RMS real del ruido ambiente leyendo directamente del micrófono.
+
+        No se deriva de energy_threshold porque ese valor ya viene multiplicado
+        por energy_boost, lo que distorsionaría la comparación de SNR. Se usa la
+        mediana de las lecturas para que un golpe puntual no eleve el piso.
+        """
+        try:
+            width = source.SAMPLE_WIDTH
+            chunk = source.CHUNK
+            rate = source.SAMPLE_RATE
+            reads = max(int((rate / chunk) * duration), 1)
+
+            values: list[float] = []
+            for _ in range(reads):
+                buf = source.stream.read(chunk)
+                if not buf:
+                    break
+                values.append(float(audioop.rms(buf, width)))
+
+            if not values:
+                return None
+            values.sort()
+            return values[len(values) // 2]
+        except Exception as exc:
+            logger.debug(f"No se pudo medir el ruido ambiente: {exc}")
+            return None
+
+    def _update_noise_floor(self, measured: float | None) -> None:
+        """
+        Actualiza el piso de ruido suavizando el valor anterior.
+
+        El suavizado evita que una medición tomada mientras alguien habla
+        dispare el piso y deje al asistente sordo durante el resto de la sesión.
+        """
+        if measured is None or measured <= 0:
+            if self._noise_floor_rms is None:
+                self._capture_noise_floor()
+            return
+
+        if self._noise_floor_rms is None:
+            self._noise_floor_rms = measured
+        else:
+            self._noise_floor_rms = 0.7 * self._noise_floor_rms + 0.3 * measured
+
     def _capture_noise_floor(self) -> None:
         """
-        Guarda una referencia del ruido ambiente medido por speech_recognition
-        para filtrar audio de fondo luego (SNR).
+        Respaldo cuando no se pudo leer el micrófono: estima el piso a partir
+        del umbral calibrado por speech_recognition.
         """
         try:
             thr = getattr(self._rec, "energy_threshold", None)
             if thr is None:
                 return
-            # energy_threshold es ya un promedio calibrado; lo usamos como piso.
-            self._noise_floor_rms = max(float(thr), self._min_rms)
+            boost = self._energy_boost if self._energy_boost > 0 else 1.0
+            # Se descuenta el boost para recuperar una estimación del ambiente.
+            self._noise_floor_rms = max(float(thr) / boost, self._min_rms)
         except Exception:
             self._noise_floor_rms = None
 
@@ -198,20 +287,55 @@ class STT:
 
     def _passes_voice_gate(self, audio: sr.AudioData) -> bool:
         """
-        Filtra audio que no supere una SNR mínima respecto al piso de ruido
-        medido en calibración. Evita capturar ruido ambiente.
+        Descarta el audio que no destaque lo suficiente sobre el ruido de fondo.
+
+        La exigencia es relativa al ruido medido, no un valor fijo: en una sala
+        en silencio basta con hablar con normalidad, mientras que en un lugar
+        concurrido se pide una voz cercana al micrófono, que es justo lo que
+        distingue al usuario de las conversaciones del entorno.
         """
         rms = self._compute_rms(audio)
         floor = self._noise_floor_rms or self._min_rms
         min_allowed = max(self._min_rms, floor * self._snr_min_ratio)
+        # Aun con mucho ruido, el listón debe seguir siendo alcanzable por una
+        # voz cercana; si no, el asistente dejaría de responder por completo.
+        min_allowed = min(min_allowed, self._max_required_rms)
         if rms < min_allowed:
             logger.debug(f"Audio descartado por SNR: rms={rms:.1f}, piso={floor:.1f}, req={min_allowed:.1f}")
             return False
         return True
 
-    def _recalibrate_async(self) -> None:
-        # Desactivar recalibración automática para evitar bloqueos si no hay micrófono disponible.
-        return
+    def _recalibrate_noise_floor(self, force: bool = False) -> bool:
+        """
+        Vuelve a medir el ruido ambiente sobre el micrófono ya seleccionado.
+
+        Se invoca desde el bucle de escucha con el micrófono cerrado, por lo que
+        abrirlo aquí es seguro. Solo se prueba el dispositivo en uso (no se
+        recorre la lista completa) para que un dispositivo ausente no bloquee la
+        escucha, y cualquier fallo se ignora: es preferible seguir con el umbral
+        anterior antes que interrumpir el reconocimiento.
+        """
+        now = time.monotonic()
+        with self._recalibration_lock:
+            if not force and (now - self._last_recalibration) < self._recalibrate_cooldown_s:
+                return False
+            self._last_recalibration = now
+
+        try:
+            with sr.Microphone(device_index=self._device_index) as source:
+                self._rec.adjust_for_ambient_noise(source, duration=self._calibration_duration)
+                measured = self._measure_ambient_rms(source, duration=0.5)
+            self._apply_energy_boost(measured)
+            self._update_noise_floor(measured)
+            piso = f"{self._noise_floor_rms:.1f}" if self._noise_floor_rms else "sin medir"
+            umbral = getattr(self._rec, "energy_threshold", 0.0) or 0.0
+            logger.info(
+                f"Ruido ambiente recalibrado: energy_threshold={umbral:.1f}, piso={piso}"
+            )
+            return True
+        except Exception as exc:
+            logger.debug(f"No se pudo recalibrar el ruido ambiente: {exc}")
+            return False
 
     # -----------------------------
     def _log_selected_microphone(self, prefix: str = "Microfono", only_if_changed: bool = False) -> None:
@@ -297,6 +421,27 @@ class STT:
         return sr.AudioData(raw, base.sample_rate, base.sample_width)
 
     # -----------------------------
+    # Supresión de ruido
+    # -----------------------------
+    def _denoise(self, audio: sr.AudioData) -> sr.AudioData:
+        """
+        Limpia el audio con el modelo de IA antes de transcribir.
+
+        Se convierte a 16 kHz mono, que es el formato con el que se entrenó el
+        modelo y el que prefiere el reconocedor. Ante cualquier problema se
+        devuelve el audio recibido sin modificar.
+        """
+        try:
+            raw16 = audio.get_raw_data(convert_rate=TARGET_SAMPLE_RATE, convert_width=2)
+            cleaned = denoiser.enhance_pcm16(raw16, TARGET_SAMPLE_RATE)
+            if cleaned is None:
+                return audio
+            return sr.AudioData(cleaned, TARGET_SAMPLE_RATE, 2)
+        except Exception as exc:
+            logger.debug(f"No se pudo aplicar supresión de ruido: {exc}")
+            return audio
+
+    # -----------------------------
     # Reconocedores
     # -----------------------------
     def _recognize_with_google(self, audio: sr.AudioData) -> tuple[str, float | None]:
@@ -347,6 +492,14 @@ class STT:
             if not self._listen_enabled.is_set():
                 time.sleep(0.02)
                 continue
+
+            # Recalibración periódica: el ruido de un stand cambia durante la
+            # jornada y un piso medido al arrancar deja de ser representativo.
+            if (
+                self._recalibrate_every_s > 0
+                and (time.monotonic() - self._last_recalibration) >= self._recalibrate_every_s
+            ):
+                self._recalibrate_noise_floor(force=True)
 
             event_bus.publish("stt:start")
             text, conf = "", None
@@ -403,9 +556,14 @@ class STT:
                         raise _SilenceDetected("timeout")
                     raise RuntimeError(f"Unable to open any microphone: {last_err}")
 
-                # Filtro anti-ruido / anti-voz-lejana
+                # Filtro anti-ruido / anti-voz-lejana. Se evalúa sobre el audio
+                # original, que es con el que se midió el piso de ruido.
                 if not self._passes_voice_gate(audio):
                     raise _SilenceDetected("noise_gate")
+
+                # Solo se limpia lo que ya se considera voz: ahorra CPU y evita
+                # procesar ruido que igualmente se iba a descartar.
+                audio = self._denoise(audio)
 
                 text, conf = self._recognize_with_google(audio)
 
@@ -414,7 +572,7 @@ class STT:
                 self._empty_results += 1
                 if self._empty_results >= self._recalibrate_after_empty:
                     self._empty_results = 0
-                    self._recalibrate_async()
+                    self._recalibrate_noise_floor()
                 time.sleep(0.2)
                 continue
             except Exception:
@@ -431,6 +589,6 @@ class STT:
                 self._empty_results += 1
                 if self._empty_results >= self._recalibrate_after_empty:
                     self._empty_results = 0
-                    self._recalibrate_async()
+                    self._recalibrate_noise_floor()
 
             time.sleep(0.05)

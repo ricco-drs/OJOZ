@@ -27,6 +27,7 @@ voz, además de registrarse en base de datos junto con su métrica de confianza.
 | Identificación de dinero | Detección del valor de billetes y monedas de sol peruano | OpenCV, Tesseract |
 | Verificación de vencimiento | Localización de la fecha de caducidad e indicación de si el producto está vigente | OpenCV, Tesseract |
 | Interacción por voz | Reconocimiento de habla e inferencia de intención en español | SpeechRecognition, gTTS |
+| Supresión de ruido | Limpieza del audio del micrófono antes de transcribirlo | DTLN (red neuronal) sobre ONNX Runtime |
 
 ## Arquitectura
 
@@ -59,6 +60,25 @@ evento no llega, evitando que la aplicación quede bloqueada.
 Los módulos no se conocen entre sí: se comunican publicando y suscribiéndose a
 eventos (`tts:start`, `tts:end`, `stt:text`, `ui:print`) sobre un bus con
 bloqueo para uso concurrente.
+
+### Supresión de ruido por red neuronal
+
+El audio del micrófono se limpia antes de transcribirlo con **DTLN** (*Dual-signal
+Transformation LSTM Network*), una red recurrente entrenada para separar voz de
+ruido de fondo. Opera en dos etapas: la primera estima una máscara sobre el
+espectro de magnitud y la segunda refina la señal en el dominio del tiempo,
+recomponiendo el resultado por solapamiento y suma.
+
+El modelo se ejecuta con ONNX Runtime sobre CPU: ocupa 4 MB, procesa a unas
+veinte veces el tiempo real y sus pesos se distribuyen con el repositorio, por lo
+que no requiere descargas ni conexión durante el uso. Si el modelo no estuviera
+disponible, el audio se transcribe sin filtrar en lugar de interrumpir el
+servicio.
+
+El filtro de energía (SNR) se evalúa sobre el audio original —comparándolo con el
+ruido de fondo medido en el propio micrófono— y solo se limpia lo que ya se
+considera voz, de modo que el modelo no se ejecuta sobre ruido que iba a
+descartarse.
 
 ### Selección del mejor fotograma
 
@@ -95,6 +115,7 @@ los modelos.
 - **OCR:** Tesseract mediante pytesseract
 - **Reconocimiento facial:** LBPH (OpenCV) con clasificador Haar
 - **Audio:** gTTS y pyttsx3 (síntesis), SpeechRecognition (reconocimiento), pygame
+- **Supresión de ruido:** DTLN sobre ONNX Runtime
 - **Interfaz:** Flet
 - **Persistencia:** SQLite
 
@@ -164,8 +185,10 @@ app/
 ├── core/
 │   ├── controller.py         Orquestación: máquina de estados y flujos de negocio
 │   ├── event_bus.py          Bus de eventos publicador/suscriptor
-│   └── router.py             Inferencia de intención a partir del texto
-├── audio/                    Síntesis (tts.py) y reconocimiento de voz (stt.py)
+│   ├── router.py             Inferencia de intención a partir del texto
+│   └── llm_agent.py          Conversación por modelo de lenguaje (opción B)
+├── audio/                    Síntesis (tts.py), reconocimiento (stt.py) y
+│                             supresión de ruido (denoise.py)
 ├── vision/                   OCR, dinero, vencimiento, rostros y acceso a cámara
 ├── db/                       Motor, capa de acceso a datos y esquema SQL
 ├── ui/                       Interfaz Flet y vista de consola
@@ -173,13 +196,94 @@ app/
 ├── utils/                    Registro de eventos y utilidades de sistema de archivos
 ├── tools/                    Utilidades de diagnóstico ajenas al tiempo de ejecución
 ├── assets/                   Recursos estáticos
+│   └── models/dtln/          Pesos del modelo de supresión de ruido
 └── data/                     Datos generados en ejecución (excluidos del repositorio)
 ```
+
+## Conversación: dos modos
+
+El asistente puede conducir el diálogo de dos maneras. La primera es la que se
+usa por defecto; la segunda se activa explícitamente.
+
+**A. Enrutador por palabras clave** (`core/router.py`, activo por defecto)
+
+Reconoce la intención buscando expresiones conocidas: *"primera opción"*,
+*"cuánto vale"*, *"fecha de vencimiento"*. Es inmediato, no cuesta nada y
+funciona sin conexión, pero solo entiende las frases previstas.
+
+**B. Conversación conducida por un modelo de lenguaje** (`core/llm_agent.py`)
+
+El modelo entiende cualquier forma de pedir las cosas, mantiene el hilo de la
+conversación y responde también a lo que se sale del guion. Decide qué función
+invocar, pero no ejecuta nada por su cuenta: cada acción la realiza la
+aplicación y el modelo solo recibe el resultado.
+
+```powershell
+$env:ANTHROPIC_API_KEY = "tu-clave"
+$env:OJOZ_LLM = "1"
+python -m app.main_flet
+```
+
+Dos límites deliberados en este modo:
+
+- **La identidad la decide el reconocimiento facial, no el modelo.** Las
+  funciones comprueban el estado real de la sesión antes de ejecutarse, así que
+  no se puede convencer al asistente de que alguien ya inició sesión.
+- **Los datos que deben ser exactos se enuncian literales.** El texto de un
+  documento, el valor de un billete y una fecha de vencimiento los dicta la
+  aplicación tal cual los obtuvo; el modelo acompaña la conversación, pero no
+  reformula esa información.
+
+Si la clave no está definida, no hay conexión o la API falla, el asistente
+vuelve solo al modo A y sigue atendiendo con normalidad.
+
+| Variable | Efecto |
+|---|---|
+| `OJOZ_LLM` | Activa (`1`) el modo conversacional |
+| `OJOZ_LLM_MODEL` | Modelo a usar (por defecto `claude-opus-5`) |
+| `ANTHROPIC_API_KEY` | Credencial de la API |
+
+## Adaptación al ruido del entorno
+
+El asistente no distingue entre entornos ni necesita configurarse para cada
+lugar: mide el ruido real del micrófono y calcula sus umbrales a partir de esa
+medición.
+
+```
+umbral de escucha = ruido medido x 1.5
+se acepta la voz  = supera el ruido medido x 3.5
+```
+
+Como el criterio es relativo, el mismo ajuste sirve en cualquier sitio: en una
+habitación en silencio basta con hablar con normalidad, mientras que en un lugar
+concurrido el listón sube solo y se exige una voz cercana al micrófono, que es
+justo lo que separa al usuario de las conversaciones del entorno. Ambos límites
+están acotados por arriba y por abajo, de manera que ni el ruido electrónico
+dispara la escucha ni un golpe puntual deja al asistente sordo.
+
+La medición se repite cada dos minutos mientras la aplicación está en uso, así
+que el asistente sigue el ambiente según cambia a lo largo del día sin que nadie
+tenga que intervenir.
+
+Para comprobarlo en un lugar concreto, `python -m app.tools.check_audio` mide el
+ruido real, indica si la voz superaría el umbral y deja dos grabaciones
+(`original.wav` y `filtrado.wav`) para comparar el efecto del modelo.
+
+Si hiciera falta corregir algún caso puntual —un micrófono con poca ganancia, por
+ejemplo—, estas variables permiten afinar sin editar código:
+
+| Variable | Efecto |
+|---|---|
+| `OJOZ_ENERGY_BOOST` | Margen del umbral sobre el ruido medido |
+| `OJOZ_SNR_RATIO` | Cuánto debe superar la voz al ruido de fondo |
+| `OJOZ_MIN_RMS` | Nivel mínimo absoluto para aceptar audio |
+| `OJOZ_DENOISE` | Activa (`1`) o desactiva (`0`) la supresión de ruido |
 
 ## Utilidades de diagnóstico
 
 ```bash
 python -m app.tools.check_camera             # cámaras detectadas por OpenCV
+python -m app.tools.check_audio              # micrófono, ruido ambiente y filtrado
 python -m app.tools.list_voices              # voces de síntesis disponibles
 python -m app.tools.db_check                 # usuarios registrados
 python -m app.tools.test_ocr_image <imagen>  # prueba de OCR sobre una imagen
@@ -200,6 +304,15 @@ contiene datos biométricos y personales.
   requieren conexión a internet.
 - El reconocimiento facial emplea LBPH, adecuado para conjuntos reducidos y
   condiciones de iluminación estables.
+
+## Modelos de terceros
+
+La supresión de ruido emplea los pesos preentrenados de **DTLN**, publicados por
+sus autores bajo licencia MIT:
+
+> Westhausen, N. L. y Meyer, B. T. (2020). *Dual-Signal Transformation LSTM
+> Network for Real-Time Noise Suppression*. Interspeech 2020.
+> <https://github.com/breizhn/DTLN>
 
 ## Autor
 

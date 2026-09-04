@@ -19,12 +19,22 @@ SpeechRecognition==3.17.0
 PyAudio==0.2.14
 pocketsphinx==5.1.1
 
+# --- Supresion de ruido por IA ---
+# Ejecuta el modelo DTLN incluido en assets/models/dtln/ (no requiere descarga
+# ni conexion: los pesos viajan con el repositorio).
+onnxruntime==1.29.0
+
 # --- Vision por computador y OCR ---
 opencv-contrib-python==5.0.0.93
 numpy==2.5.1
 imutils==0.5.4
 pytesseract==0.3.13
 pillow==12.3.0
+
+# --- Conversacion por modelo de lenguaje (opcion B, desactivada por defecto) ---
+# Solo se usa si se activa con OJOZ_LLM=1 y existe ANTHROPIC_API_KEY.
+# Sin ella el asistente funciona con el enrutador por palabras clave de siempre.
+anthropic==1.0.0
 
 # --- Utilidades ---
 colorama==0.4.6
