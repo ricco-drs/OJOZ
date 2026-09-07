@@ -41,15 +41,14 @@ Tus respuestas se convierten en voz, así que:
 - Escribe en texto plano corrido. Nada de listas, viñetas, asteriscos ni emojis.
 - Usa números en palabras cuando sea natural al hablar.
 
-Puedes ayudar con cuatro cosas: leer documentos en voz alta, decir el valor de \
-billetes y monedas, verificar fechas de vencimiento y describir lo que ve la \
-cámara.
+Puedes ayudar con tres cosas: leer documentos en voz alta, decir el valor de \
+billetes y monedas, y verificar fechas de vencimiento.
 
 Cómo trabajar:
 - Antes de usar la cámara, avisa en la misma respuesta qué debe hacer la persona \
 (por ejemplo, dónde poner el documento). Ese aviso se escucha antes de que la \
 cámara empiece a capturar.
-- Para usar cualquiera de las cuatro funciones, la persona debe estar \
+- Para usar cualquiera de las tres funciones, la persona debe estar \
 identificada. Si es nueva, ofrécele registrarse; si ya tiene cuenta, pídele su \
 nombre para verificar su identidad.
 - Cuando una herramienta te devuelva un resultado, la aplicación ya se lo habrá \
@@ -161,20 +160,6 @@ TOOLS = [
         "strict": True,
     },
     {
-        "name": "describir_escena",
-        "description": (
-            "Entrega el enlace al servicio que describe todo lo que ve la cámara. "
-            "Úsala cuando pidan una descripción general del entorno."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    },
-    {
         "name": "cerrar_sesion",
         "description": (
             "Cierra la sesión de la persona y deja el asistente listo para otra. "
@@ -247,7 +232,7 @@ class LLMAgent:
                 # El SDK resuelve la credencial del entorno; sin ella no se
                 # puede usar esta capa y se sigue con el flujo por palabras clave.
                 if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-                    logger.info(
+                    logger.debug(
                         "Conversación por modelo desactivada: falta ANTHROPIC_API_KEY. "
                         "Se usa el flujo por palabras clave."
                     )
@@ -257,10 +242,10 @@ class LLMAgent:
                     timeout=llm_config.timeout_seconds,
                     max_retries=llm_config.max_retries,
                 )
-                logger.info(f"Conversación por modelo activa ({llm_config.model}).")
+                logger.debug(f"Conversación por modelo activa ({llm_config.model}).")
                 return self._client
             except ImportError:
-                logger.info(
+                logger.debug(
                     "Conversación por modelo desactivada: falta el paquete anthropic. "
                     "Instala con: pip install anthropic"
                 )
@@ -364,7 +349,7 @@ class LLMAgent:
                 salida, error = f"La función {llamada.name} no existe.", True
             else:
                 try:
-                    logger.info(f"El modelo solicita: {llamada.name}({llamada.input})")
+                    logger.debug(f"El modelo solicita: {llamada.name}({llamada.input})")
                     salida, error = accion(**(llamada.input or {})), False
                 except Exception as exc:
                     logger.error(f"Fallo al ejecutar {llamada.name}: {exc}", exc_info=True)

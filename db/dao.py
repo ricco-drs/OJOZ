@@ -32,7 +32,12 @@ def user_exists(name: str) -> bool:
         return cur.fetchone() is not None
 
 # ---------- Photos ----------
-def insert_face_photos(user_id: int, file_paths: Iterable[str], w: int, h: int) -> int:
+def insert_face_photos(
+    user_id: int,
+    file_paths: Iterable[str],
+    w: Optional[int] = None,
+    h: Optional[int] = None,
+) -> int:
     """Inserta las fotos y devuelve cuantas filas se insertaron."""
     rows = [(user_id, p, w, h) for p in file_paths]
     with get_conn() as conn:
@@ -44,6 +49,24 @@ def insert_face_photos(user_id: int, file_paths: Iterable[str], w: int, h: int) 
         # acumulado de toda la conexion y daria un numero enganoso.
         return cur.rowcount if cur.rowcount != -1 else len(rows)
 
+def replace_face_photos(
+    user_id: int,
+    file_paths: Iterable[str],
+    w: Optional[int] = None,
+    h: Optional[int] = None,
+) -> int:
+    """Reemplaza en una transaccion las capturas vigentes de un usuario."""
+    rows = [(user_id, path, w, h) for path in file_paths]
+    with get_conn() as conn:
+        conn.execute("DELETE FROM face_photos WHERE user_id = ?", (user_id,))
+        if not rows:
+            return 0
+        cur = conn.executemany(
+            "INSERT INTO face_photos(user_id, file_path, width, height) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        return cur.rowcount if cur.rowcount != -1 else len(rows)
+
 def insert_enrollment(user_id: int, photos_count: int, notes: Optional[str] = None) -> int:
     with get_conn() as conn:
         cur = conn.execute(
@@ -53,12 +76,17 @@ def insert_enrollment(user_id: int, photos_count: int, notes: Optional[str] = No
         return cur.lastrowid
 
 # ---------- Models ----------
-def upsert_global_model(file_path: str, threshold: float, version: str = "1.0") -> int:
+def upsert_global_model(
+    file_path: str,
+    threshold: float,
+    version: str = "1.0",
+    model_type: str = "ArcFace",
+) -> int:
     with get_conn() as conn:
         # modelo global: user_id NULL
         cur = conn.execute(
             "INSERT INTO models(user_id, model_type, version, file_path, threshold) VALUES (NULL, ?, ?, ?, ?)",
-            ("LBPH", version, file_path, threshold)
+            (model_type, version, file_path, threshold)
         )
         return cur.lastrowid
 

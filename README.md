@@ -22,11 +22,11 @@ voz, además de registrarse en base de datos junto con su métrica de confianza.
 
 | Función | Descripción | Tecnología |
 |---|---|---|
-| Registro y autenticación | Enrolamiento facial (300 capturas) y verificación por reconocimiento | OpenCV, LBPH |
+| Registro y autenticación | Enrolamiento con 20 capturas de calidad y verificación por embeddings | InsightFace (SCRFD + ArcFace) |
 | Lectura de documentos | Extracción y lectura en voz alta del texto de un documento | Tesseract OCR |
 | Identificación de dinero | Detección del valor de billetes y monedas de sol peruano | OpenCV, Tesseract |
 | Verificación de vencimiento | Localización de la fecha de caducidad e indicación de si el producto está vigente | OpenCV, Tesseract |
-| Interacción por voz | Reconocimiento de habla e inferencia de intención en español | SpeechRecognition, gTTS |
+| Interacción por voz | Reconocimiento de habla e inferencia de intención en español | SpeechRecognition, ElevenLabs/gTTS |
 | Supresión de ruido | Limpieza del audio del micrófono antes de transcribirlo | DTLN (red neuronal) sobre ONNX Runtime |
 
 ## Arquitectura
@@ -111,10 +111,10 @@ los modelos.
 ## Stack tecnológico
 
 - **Lenguaje:** Python 3.13
-- **Visión por computador:** OpenCV (contrib), NumPy, imutils
+- **Visión por computador:** OpenCV, NumPy, imutils
 - **OCR:** Tesseract mediante pytesseract
-- **Reconocimiento facial:** LBPH (OpenCV) con clasificador Haar
-- **Audio:** gTTS y pyttsx3 (síntesis), SpeechRecognition (reconocimiento), pygame
+- **Reconocimiento facial:** InsightFace `buffalo_l` (detector SCRFD y embeddings ArcFace) sobre ONNX Runtime
+- **Audio:** ElevenLabs/gTTS y pyttsx3 (síntesis), SpeechRecognition (reconocimiento), pygame
 - **Supresión de ruido:** DTLN sobre ONNX Runtime
 - **Interfaz:** Flet
 - **Persistencia:** SQLite
@@ -128,14 +128,9 @@ los modelos.
   Descarga: <https://github.com/UB-Mannheim/tesseract/wiki>.
   Se busca por defecto en `C:\Program Files\Tesseract-OCR\tesseract.exe`; puede
   indicarse otra ruta mediante la variable de entorno `TESSERACT_CMD`.
-- **Clasificador Haar de rostros** (`haarcascade_frontalface_default.xml`).
-  OpenCV 5 ya no distribuye estos archivos, por lo que debe aportarse:
-  1. Copiarlo en `assets/haarcascades/`, o
-  2. indicar su ruta mediante la variable de entorno `HAARCASCADE_PATH`, o
-  3. instalar OpenCV 4.x, que sí lo incluye.
-
-  Sin este archivo, el registro y la autenticación facial se interrumpen con un
-  mensaje explicativo; el resto de funcionalidades opera con normalidad.
+- En la primera preparación, conexión a internet para descargar el paquete
+  `buffalo_l` de InsightFace. Después, detección y reconocimiento se ejecutan
+  localmente; las fotos y embeddings no se envían a un servicio externo.
 
 ## Instalación
 
@@ -148,6 +143,14 @@ cd app
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+Antes de la demostración, descarga el modelo y comprueba que ONNX Runtime puede
+usar la GPU:
+
+```bash
+cd ..
+python -m app.tools.check_face
 ```
 
 ## Ejecución
@@ -172,7 +175,6 @@ python -m app.main         # modo consola
 | 1 | Leer un documento | "primera opción", "lee este documento" |
 | 2 | Identificar el valor del dinero | "segunda opción", "cuánto vale esto" |
 | 3 | Verificar fecha de vencimiento | "tercera opción", "fecha de vencimiento" |
-| 4 | Descripción de la escena (servicio externo) | "cuarta opción", "describe lo que ves" |
 
 Para finalizar: "salir" cierra la sesión y "cerrar aplicación" termina el
 programa.
@@ -240,8 +242,16 @@ vuelve solo al modo A y sigue atendiendo con normalidad.
 | Variable | Efecto |
 |---|---|
 | `OJOZ_LLM` | Activa (`1`) el modo conversacional |
-| `OJOZ_LLM_MODEL` | Modelo a usar (por defecto `claude-opus-5`) |
+| `OJOZ_LLM_MODEL` | Modelo a usar (por defecto `claude-sonnet-5`) |
 | `ANTHROPIC_API_KEY` | Credencial de la API |
+
+El reconocimiento facial se puede ajustar sin modificar código:
+
+| Variable | Efecto |
+|---|---|
+| `OJOZ_FACE_PROVIDER` | `auto` (predeterminado), `cuda` o `cpu` |
+| `OJOZ_FACE_MODEL` | Paquete de InsightFace; por defecto `buffalo_l` |
+| `OJOZ_FACE_THRESHOLD` | Similitud coseno mínima; por defecto `0.50` |
 
 ## Adaptación al ruido del entorno
 
@@ -279,10 +289,26 @@ ejemplo—, estas variables permiten afinar sin editar código:
 | `OJOZ_MIN_RMS` | Nivel mínimo absoluto para aceptar audio |
 | `OJOZ_DENOISE` | Activa (`1`) o desactiva (`0`) la supresión de ruido |
 
+Para una voz mas natural, OJOZ usa ElevenLabs como primer motor cuando existen
+`ELEVENLABS_API_KEY` y `ELEVENLABS_VOICE_ID`. Si la API no responde, conserva el
+respaldo automatico gTTS y luego pyttsx3.
+
+```powershell
+$env:ELEVENLABS_API_KEY = "tu_clave_nueva"
+$env:ELEVENLABS_VOICE_ID = "id_de_la_voz_elegida"
+$env:ELEVENLABS_MODEL = "eleven_flash_v2_5"
+```
+
+La clave se lee desde el entorno y no debe escribirse en el codigo ni publicarse
+en GitHub. `ELEVENLABS_VOICE_ID` se obtiene desde la biblioteca de voces de tu
+cuenta. Un error HTTP 402 significa que la cuenta no tiene creditos disponibles
+o que ElevenLabs solicita activar un pago; el limite de la clave no es saldo.
+
 ## Utilidades de diagnóstico
 
 ```bash
 python -m app.tools.check_camera             # cámaras detectadas por OpenCV
+python -m app.tools.check_face               # descarga/carga ArcFace y verifica el proveedor
 python -m app.tools.check_audio              # micrófono, ruido ambiente y filtrado
 python -m app.tools.list_voices              # voces de síntesis disponibles
 python -m app.tools.db_check                 # usuarios registrados
@@ -302,10 +328,17 @@ contiene datos biométricos y personales.
   peruano.
 - El reconocimiento y la síntesis de voz dependen de servicios en línea y
   requieren conexión a internet.
-- El reconocimiento facial emplea LBPH, adecuado para conjuntos reducidos y
-  condiciones de iluminación estables.
+- ArcFace verifica identidad, pero no incluye detección de vida: una fotografía
+  presentada a la cámara podría superar la autenticación.
 
 ## Modelos de terceros
+
+El código de InsightFace se distribuye con licencia MIT, pero los modelos
+preentrenados oficiales, incluido `buffalo_l`, se ofrecen únicamente para
+investigación no comercial. Esto es compatible con la demostración académica;
+un despliegue comercial requiere pesos con una licencia apropiada.
+
+<https://github.com/deepinsight/insightface/tree/master/python-package>
 
 La supresión de ruido emplea los pesos preentrenados de **DTLN**, publicados por
 sus autores bajo licencia MIT:

@@ -329,7 +329,7 @@ class STT:
             self._update_noise_floor(measured)
             piso = f"{self._noise_floor_rms:.1f}" if self._noise_floor_rms else "sin medir"
             umbral = getattr(self._rec, "energy_threshold", 0.0) or 0.0
-            logger.info(
+            logger.debug(
                 f"Ruido ambiente recalibrado: energy_threshold={umbral:.1f}, piso={piso}"
             )
             return True
@@ -365,7 +365,7 @@ class STT:
 
         self._last_logged_device_index = self._device_index
         self._has_logged_mic = True
-        logger.info(f"{prefix}: idx={self._device_index}, nombre='{self._mic_name}'")
+        logger.debug(f"{prefix}: idx={self._device_index}, nombre='{self._mic_name}'")
 
     # -----------------------------
     # Captura de audio extendida

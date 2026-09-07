@@ -35,10 +35,10 @@ CREATE TABLE IF NOT EXISTS enrollments (
 CREATE TABLE IF NOT EXISTS models (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE, -- NULL = modelo global
-  model_type    TEXT NOT NULL,             -- "LBPH"
+  model_type    TEXT NOT NULL,             -- "ArcFace"
   version       TEXT,                      -- "1.0", hash o semver si quieres
-  file_path     TEXT NOT NULL,             -- app/data/modelos/modeloLBPHFace.xml
-  threshold     REAL,                      -- p.ej., 70
+  file_path     TEXT NOT NULL,             -- app/data/modelos/arcface_gallery.npz
+  threshold     REAL,                      -- similitud coseno, p.ej. 0.50
   checksum_sha256 TEXT,                    -- opcional (para detectar cambios)
   trained_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );

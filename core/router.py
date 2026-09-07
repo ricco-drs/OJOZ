@@ -24,7 +24,6 @@ def infer_intent(text: str) -> Optional[str]:
     - "read_image"        (Opcion 1 - OCR, menu autenticado)
     - "currency_value"    (Opcion 2 - dinero)
     - "verify_expiry"     (Opcion 3 - vencimiento)
-    - "describe_everything" (Opcion 4 - descripcion completa / enlace)
     """
     t = _normalize(text)
 
@@ -51,7 +50,6 @@ def infer_intent(text: str) -> Optional[str]:
     #   primera opcion -> leer documento (OCR)
     #   segunda opcion -> valor del dinero
     #   tercera opcion -> fecha de vencimiento
-    #   cuarta opcion  -> describir todo lo que ve (enlace externo)
     # (se usan normalmente DESPUES de que el usuario ya se autentico)
     # =========================================================
     if "primera" in t and "opcion" in t:
@@ -66,14 +64,6 @@ def infer_intent(text: str) -> Optional[str]:
         return "verify_expiry"
     if "opcion 3" in t or "opcion tres" in t or "opcion numero tres" in t:
         return "verify_expiry"
-
-    # Cuarta opcion = Describir todo lo que ve (provee enlace)
-    if "cuarta" in t and "opcion" in t:
-        return "describe_everything"
-    if "opcion 4" in t or "opcion cuatro" in t or "opcion numero cuatro" in t:
-        return "describe_everything"
-    if any(phrase in t for phrase in ["modo pro", "modo unificado", "modo completo", "modo avanzado"]):
-        return "describe_everything"
 
     # Frases alternativas para OCR
     if "leer" in t and any(k in t for k in ["documento", "texto", "imagen"]):
@@ -221,22 +211,6 @@ def infer_intent(text: str) -> Optional[str]:
     # =========================================================
     # Otros intents globales
     # =========================================================
-
-    # Solicitud de descripcion general de la escena
-    if any(
-        phrase in t
-        for phrase in [
-            "describir todo lo que veo",
-            "describeme lo que ves",
-            "que estas viendo",
-            "que ves en la camara",
-            "que ves en la cámara",
-            "describir lo que ves",
-            "que ves ahi",
-            "que ves alli",
-        ]
-    ):
-        return "describe_everything"
 
     # Solicitar menu de opciones despues de autenticacion
     pedir_menu = any(

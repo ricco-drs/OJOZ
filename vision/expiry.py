@@ -1,14 +1,15 @@
 # app/vision/expiry.py
 from __future__ import annotations
-import time, re, threading, queue
+import base64, os, time, re, threading, queue
 from typing import Optional, Tuple, List, Dict
 import cv2
 import numpy as np
 import pytesseract
-from datetime import date
+from datetime import date, datetime
 
 # Config de vision (indice de camara) y ruta de Tesseract, ambas centralizadas.
-from app.config.settings import configure_tesseract, vision
+from app.config.settings import configure_tesseract, llm as llm_config, vision
+from app.vision.camera import rotate_frame
 
 configure_tesseract()
 
@@ -195,7 +196,135 @@ def _extract_roi(img: np.ndarray, box: Tuple[int,int,int,int]) -> np.ndarray:
     x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
     return img[y0:y1, x0:x1]
 
+def _claude_vision_expiry(frame: np.ndarray) -> Tuple[bool, Optional[str], Optional[bool], Optional[float]]:
+    """
+    Le pide a Claude que encuentre la fecha de vencimiento en el empaque.
+
+    A diferencia de Tesseract + regex, Claude puede decidir cual fecha es la
+    de vencimiento (no la de fabricacion ni un codigo de lote) y leer texto
+    en relieve o formatos no previstos. El calculo de vencido/vigente se hace
+    en Python contra la fecha de hoy, nunca lo decide el modelo.
+    """
+    from app.utils.logger import logger
+
+    try:
+        import anthropic
+    except ImportError:
+        return False, None, None, None
+
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        return False, None, None, None
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=llm_config.model,
+            max_tokens=20,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": base64.b64encode(buffer.tobytes()).decode("ascii"),
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Esta foto muestra el empaque de un producto. Busca la fecha "
+                                "de vencimiento o caducidad (etiquetas como VENC, EXP, F.V., "
+                                "CAD, Best Before, Use By) y no otra fecha del empaque, como "
+                                "la de fabricacion o un codigo de lote. Responde UNICAMENTE en "
+                                "este formato, sin nada mas alrededor: DD/MM/AAAA (por ejemplo "
+                                "15/03/2026). Si no encuentras una fecha de vencimiento clara, "
+                                "responde unicamente: NINGUNO"
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(f"Claude Vision fallo para vencimiento, se usa OCR local: {exc}")
+        return False, None, None, None
+
+    raw = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+
+    if not raw or raw.upper() == "NINGUNO":
+        return False, None, None, None
+
+    try:
+        parsed = datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        logger.debug(f"Fecha de Claude Vision no reconocida: {raw!r}")
+        return False, None, None, None
+
+    is_expired = parsed < date.today()
+    return True, parsed.strftime("%d/%m/%Y"), is_expired, 92.0
+
+
+def _detect_expiry_with_claude(seconds: float) -> Tuple[bool, Optional[str], Optional[bool], Optional[float]]:
+    """
+    Abre la camara, muestra el preview y manda la mejor foto a Claude Vision.
+    Sin ANTHROPIC_API_KEY no abre la camara: se cae al flujo de OCR+regex.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return False, None, None, None
+
+    cap = cv2.VideoCapture(getattr(vision, "camera_index", 0), cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        return False, None, None, None
+
+    frame = None
+    try:
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            ret, current = cap.read()
+            if not ret:
+                break
+            current = rotate_frame(current)
+            frame = current
+            if getattr(vision, "show_preview", False):
+                show = current.copy()
+                time_left = int(seconds - (time.time() - t0)) + 1
+                cv2.putText(
+                    show,
+                    f"Muestre la fecha de vencimiento - {time_left}s",
+                    (40, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 0),
+                    3,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("Verificacion de Vencimiento", show)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    if frame is None:
+        return False, None, None, None
+
+    return _claude_vision_expiry(frame)
+
+
 def check_expiry_best_frame(seconds: float = 6.0) -> Tuple[bool, Optional[str], Optional[bool], Optional[float]]:
+    # Primero Claude Vision (decide cual fecha es la de vencimiento); si no
+    # hay clave configurada o falla, se sigue con OCR + regex de siempre.
+    claude_result = _detect_expiry_with_claude(seconds=min(seconds, 8.0))
+    if claude_result[0]:
+        return claude_result
+    return _check_expiry_ocr(seconds=seconds)
+
+
+def _check_expiry_ocr(seconds: float = 6.0) -> Tuple[bool, Optional[str], Optional[bool], Optional[float]]:
     """
     Captura frames durante `seconds` y trata de leer la fecha de vencimiento.
     El preview corre fluido y el OCR se procesa en un hilo aparte.
@@ -269,6 +398,7 @@ def check_expiry_best_frame(seconds: float = 6.0) -> Tuple[bool, Optional[str], 
             ret, frame = cap.read()
             if not ret:
                 break
+            frame = rotate_frame(frame)
 
             if frame_queue.full():
                 try:

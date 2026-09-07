@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import re
 import threading
 import time
@@ -150,13 +151,6 @@ class Controller:
             self.tts.join()
             return self._expiry_workflow(capture_seconds=_segundos_validos(segundos), llm_mode=True)
 
-        def describir_escena() -> str:
-            if (error := _sesion_iniciada()) is not None:
-                return error
-            # El enlace se enuncia literal, sin pasar por el modelo.
-            self.speak("Entra al siguiente link https://ojoz-tts-820628120958.southamerica-west1.run.app")
-            return "Se le dictó el enlace del servicio de descripción."
-
         def cerrar_sesion() -> str:
             nombre = self._user_name or "la persona"
             self._user_name = None
@@ -183,7 +177,6 @@ class Controller:
             "leer_documento": leer_documento,
             "identificar_dinero": identificar_dinero,
             "verificar_vencimiento": verificar_vencimiento,
-            "describir_escena": describir_escena,
             "cerrar_sesion": cerrar_sesion,
             "cerrar_aplicacion": cerrar_aplicacion,
         }
@@ -419,7 +412,19 @@ class Controller:
     def start(self) -> None:
         """Arranca el reconocimiento y da un saludo inicial por TTS."""
         self.stt.start()
-        self.speak("Buenos días, soy OJOZ, tu asistente de visión artificial. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+
+        dev_login = os.environ.get("OJOZ_DEV_LOGIN", "").strip()
+        if dev_login:
+            # Atajo solo para pruebas locales: entra autenticado sin pasar por
+            # la camara, para probar el resto de funciones cuando el
+            # enrolamiento facial no es viable (poca luz, sin camara, etc.).
+            # No usar en la demo real: no verifica identidad.
+            self._user_name = dev_login
+            self._authenticated = True
+            self.speak(f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?")
+            return
+
+        self.speak("Hola, soy OJOZ, tu asistente. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
 
     def speak(self, text: str) -> None:
         """Envía texto a TTS (el gate de STT lo gestiona tts:start/tts:end o el watchdog)."""
@@ -722,7 +727,9 @@ class Controller:
 
             def _restart_flow():
                 time.sleep(1.5)  # Esperar un poco después de la despedida
-                self.speak("Buenos días, soy OJOZ, tu asistente de visión artificial. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+                # Saludo corto: la presentacion completa solo se da una vez,
+                # al arrancar la app (ver start()), no en cada reinicio de sesion.
+                self.speak("¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?")
 
             threading.Thread(target=_restart_flow, daemon=True).start()
             # Devolver el mensaje de despedida (lo dirá _on_stt_text)
@@ -752,7 +759,6 @@ class Controller:
                     "1. Leer lo que aparece en la cámara.\n"
                     "2. Decirte el valor del dinero que me estés mostrando.\n"
                     "3. Revisar la fecha de vencimiento de un producto.\n"
-                    "4. Describir todo lo que ve la camara (te dare un enlace).\n"
                     f"¿Qué opción deseas, {self._user_name}?"
                 )
             else:
@@ -807,13 +813,6 @@ class Controller:
             else:
                 return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
 
-        # ===== Cuarta opción del menú: Describir todo lo que ve (enlace externo) =====
-        if intent == "describe_everything":
-            if self._authenticated and self._user_name:
-                return "Entra al siguiente link https://ojoz-tts-820628120958.southamerica-west1.run.app"
-            else:
-                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
-
         return None
 
     # -----------------------------
@@ -862,6 +861,13 @@ class Controller:
             self._fallback_timer = None
             current_state = self.state
 
+        if self.tts.is_speaking():
+            # El TTS sigue hablando de verdad (frase larga): no forzar el
+            # microfono a mitad de la frase, o captaria la propia voz de OJOZ
+            # por el parlante. Se reintenta pasado el mismo plazo de seguridad.
+            self._schedule_fallback_rearm()
+            return
+
         # Solo reactivar si no estamos ya escuchando
         if current_state == "LISTENING":
             return
@@ -891,7 +897,7 @@ class Controller:
     # =============================
     def _enroll_workflow(self, name: str, llm_mode: bool = False) -> str:
         """
-        Captura N fotos del usuario y reentrena el modelo LBPH.
+        Captura fotos del usuario y actualiza la galeria de embeddings ArcFace.
 
         En `llm_mode` no encadena los mensajes de bienvenida (los da el modelo) y
         devuelve un resumen. El alta de la sesión la marca este código, no el modelo.
@@ -906,18 +912,22 @@ class Controller:
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros para {name}...")
             
-            logger.info(f"=== INICIO ENROLAMIENTO: {name} ===")
-            
-            # 1. Crear o recuperar el usuario en la BD
-            user_id = dao.get_or_create_user(name)
-            logger.info(f"Usuario en BD: id={user_id}, nombre={name}")
+            logger.debug(f"=== INICIO ENROLAMIENTO: {name} ===")
 
-            # 2. Capturar fotos
+            # 1. Capturar fotos (todavia sin crear la cuenta: si falla, no debe
+            # quedar un usuario sin rostro registrado en la BD)
             saved = capture_faces(name=name, count=vision.capture_count, show_preview=vision.show_preview)
-            logger.info(f"Captura completada: {saved} fotos")
+            logger.debug(f"Captura completada: {saved} fotos")
 
-            if saved < 10:
-                raise RuntimeError(f"Se capturaron muy pocas fotos ({saved}). Se requieren al menos 10.")
+            if saved < vision.min_enrollment_photos:
+                raise RuntimeError(
+                    f"Se capturaron muy pocas fotos ({saved}). "
+                    f"Se requieren al menos {vision.min_enrollment_photos}."
+                )
+
+            # 2. Recien con fotos validas, crear el usuario en la BD
+            user_id = dao.get_or_create_user(name)
+            logger.debug(f"Usuario en BD: id={user_id}, nombre={name}")
 
             # 3. Registrar las fotos en la BD
             user_folder = get_user_folder(name)
@@ -925,28 +935,29 @@ class Controller:
             photo_paths = [str(p.relative_to(vision.base_dir)) for p in photo_files]
             
             if photo_paths:
-                dao.insert_face_photos(user_id, photo_paths, vision.face_size[0], vision.face_size[1])
-                logger.info(f"Registradas {len(photo_paths)} fotos en la BD")
+                dao.replace_face_photos(user_id, photo_paths)
+                logger.debug(f"Registradas {len(photo_paths)} fotos en la BD")
             
             # 4. Registrar la sesión de enrolamiento
             enrollment_id = dao.insert_enrollment(user_id, saved, notes=f"Captura automática de {saved} rostros")
-            logger.info(f"Enrollment registrado con id={enrollment_id}")
+            logger.debug(f"Enrollment registrado con id={enrollment_id}")
 
-            # 5. Entrenar el modelo
-            event_bus.publish("ui:print", role="sys", text=f"Se capturaron {saved} rostros. Entrenando modelo...")
-            logger.info("Iniciando entrenamiento del modelo...")
+            # 5. Generar la galeria de embeddings
+            event_bus.publish("ui:print", role="sys", text=f"Se capturaron {saved} rostros. Creando galeria facial...")
+            logger.debug("Generando embeddings ArcFace...")
             
             model_path = train_dataset()
-            logger.info(f"Modelo entrenado exitosamente: {model_path}")
+            logger.debug(f"Galeria ArcFace actualizada: {model_path}")
 
             # 6. Registrar el modelo en la BD
             model_relative = str(Path(model_path).relative_to(vision.base_dir))
             model_id = dao.upsert_global_model(
                 file_path=model_relative,
-                threshold=float(vision.lbph_threshold),
-                version="1.0"
+                threshold=vision.face_similarity_threshold,
+                version=vision.face_model_name,
+                model_type="ArcFace"
             )
-            logger.info(f"Modelo registrado en BD con id={model_id}")
+            logger.debug(f"Modelo registrado en BD con id={model_id}")
 
             event_bus.publish("camera.closed", index=vision.camera_index)
             if not llm_mode:
@@ -954,7 +965,7 @@ class Controller:
                 self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
             event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
             event_bus.publish("ui:print", role="sys", text=f"[OK] Modelo actualizado: {model_path}")
-            logger.info(f"=== FIN ENROLAMIENTO EXITOSO: {name} ===")
+            logger.debug(f"=== FIN ENROLAMIENTO EXITOSO: {name} ===")
 
             if llm_mode:
                 # La sesión se marca aquí, en el código: el modelo no decide quién
@@ -990,7 +1001,7 @@ class Controller:
 
     def _auth_workflow(self, llm_mode: bool = False) -> str:
         """
-        Reconocimiento facial (LBPH) durante unos segundos y saluda si se reconoce.
+        Verifica la identidad mediante embeddings ArcFace durante unos segundos.
 
         En `llm_mode` devuelve el veredicto en lugar de conducir la conversación.
         Quien decide si la identidad es válida es el reconocimiento facial: el
@@ -1005,11 +1016,14 @@ class Controller:
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
 
-            ok, recognized_name, conf = recognize_best_frame(seconds=5.0)
+            ok, recognized_name, conf = recognize_best_frame(
+                seconds=5.0,
+                expected_name=self._user_name,
+            )
 
             event_bus.publish("camera.closed", index=vision.camera_index)
             
-            logger.info(f"Resultado autenticación: ok={ok}, nombre={recognized_name}, confianza={conf}, esperado={self._user_name}")
+            logger.debug(f"Resultado autenticación: ok={ok}, nombre={recognized_name}, confianza={conf}, esperado={self._user_name}")
 
             if ok and recognized_name:
                 # Se reconoció un rostro

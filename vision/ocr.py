@@ -1,4 +1,7 @@
 # app/vision/ocr.py
+import base64
+import json
+import os
 import cv2
 import pytesseract
 import numpy as np
@@ -7,6 +10,8 @@ import re
 import unicodedata
 from datetime import datetime
 from typing import Optional, Tuple, List
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from app.config.settings import configure_tesseract, vision
 from app.vision.camera import open_camera, read_frame, release
@@ -127,6 +132,120 @@ def _sanitize_text(text: str) -> str:
     if not cleaned and text.strip():
         return text.strip()
     return cleaned
+
+
+def _google_vision_ocr(frame: np.ndarray, lang: str) -> Tuple[str, float]:
+    """
+    OCR con Google Cloud Vision, si hay GOOGLE_VISION_API_KEY configurada.
+
+    Suele leer mejor que Tesseract fotos reales (torcidas, con sombra, mala
+    letra). Sin la clave no hace nada: el llamador sigue con Tesseract como
+    respaldo local, igual que el TTS cae a gTTS si falta ELEVENLABS_API_KEY.
+    """
+    from app.utils.logger import logger
+
+    api_key = os.environ.get("GOOGLE_VISION_API_KEY", "").strip()
+    if not api_key:
+        return "", 0.0
+
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        return "", 0.0
+
+    payload = json.dumps(
+        {
+            "requests": [
+                {
+                    "image": {"content": base64.b64encode(buffer.tobytes()).decode("ascii")},
+                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                    "imageContext": {"languageHints": [lang or "es"]},
+                }
+            ]
+        }
+    ).encode("utf-8")
+
+    endpoint = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
+    request = Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=15.0) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError) as exc:
+        logger.warning(f"Google Cloud Vision fallo, se usa Tesseract: {exc}")
+        return "", 0.0
+    except Exception as exc:
+        logger.warning(f"Google Cloud Vision fallo, se usa Tesseract: {exc}")
+        return "", 0.0
+
+    try:
+        first_response = body.get("responses", [{}])[0]
+    except (IndexError, AttributeError):
+        return "", 0.0
+
+    if "error" in first_response:
+        logger.warning(f"Google Cloud Vision error: {first_response['error']}")
+        return "", 0.0
+
+    raw_text = first_response.get("fullTextAnnotation", {}).get("text", "")
+    text = _sanitize_text(raw_text)
+    if not text:
+        return "", 0.0
+    return text, 95.0
+
+
+def _clean_ocr_text_with_claude(raw_text: str) -> str:
+    """
+    Limpia el texto extraido por OCR (Google Vision o Tesseract) descartando
+    ruido: palabras sin sentido, caracteres sueltos o simbolos que no son
+    palabras reales en espanol ni ingles, tipicos de errores de reconocimiento.
+
+    No traduce ni reformula, solo quita el ruido. Sin ANTHROPIC_API_KEY, o si
+    la llamada falla, se devuelve el texto original sin tocar.
+    """
+    if not raw_text or not raw_text.strip():
+        return raw_text
+
+    from app.utils.logger import logger
+
+    try:
+        import anthropic
+    except ImportError:
+        return raw_text
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "El siguiente texto se extrajo con OCR de un documento y puede "
+                        "tener ruido: palabras sin sentido, caracteres sueltos o simbolos "
+                        "que no son palabras reales en espanol ni en ingles, producto de "
+                        "errores de reconocimiento. Devuelve el mismo texto pero quitando "
+                        "unicamente ese ruido. No traduzcas, no reformules, no agregues "
+                        "nada nuevo, no corrijas ortografia de palabras validas: solo "
+                        "elimina lo que claramente no es una palabra real. Si una linea "
+                        "queda vacia al quitar el ruido, omite esa linea. Responde "
+                        "unicamente con el texto limpio, sin comentarios ni explicaciones.\n\n"
+                        f"Texto:\n{raw_text}"
+                    ),
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(f"Limpieza de OCR con Claude fallo, se usa el texto sin limpiar: {exc}")
+        return raw_text
+
+    cleaned = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    return cleaned or raw_text
 
 
 def _extract_text(image, lang='spa'):
@@ -378,7 +497,21 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     gray_base = cv2.cvtColor(captured_frame, cv2.COLOR_BGR2GRAY)
 
     best_candidate = None
-    angles = [0]  # reducir tiempo: solo 0 grados
+
+    # Si hay GOOGLE_VISION_API_KEY configurada, probar primero: suele leer
+    # mejor fotos reales (torcidas, con sombra) que Tesseract.
+    google_text, google_conf = _google_vision_ocr(captured_frame, lang)
+    if google_text:
+        best_candidate = {
+            "text": google_text,
+            "conf": google_conf,
+            "label": "google-vision",
+            "angle": 0,
+            "processed": {"enhanced": gray_base, "binary": gray_base, "binary_inv": gray_base},
+            "gray": gray_base,
+        }
+
+    angles = [] if best_candidate else [0]  # saltar Tesseract si Google ya funciono
 
     for angle in angles:
         rotated_gray = _rotate_image(gray_base, angle)
@@ -501,6 +634,10 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     print(f"[OK] Resultado guardado en: {result_path}")
 
     cv2.destroyAllWindows()
+
+    # Limpiar ruido de OCR (palabras sin sentido) antes de enunciarlo. El
+    # archivo de resultado de arriba ya guardo el texto crudo para depurar.
+    text = _clean_ocr_text_with_claude(text)
 
     # Considerar exitoso si hay texto, aunque la confianza sea baja (para no devolver vacío)
     ok = bool(text)

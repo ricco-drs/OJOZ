@@ -19,13 +19,14 @@ SpeechRecognition==3.17.0
 PyAudio==0.2.14
 pocketsphinx==5.1.1
 
-# --- Supresion de ruido por IA ---
-# Ejecuta el modelo DTLN incluido en assets/models/dtln/ (no requiere descarga
-# ni conexion: los pesos viajan con el repositorio).
-onnxruntime==1.29.0
+# --- Inferencia de IA local (DTLN + ArcFace) ---
+# La variante GPU incluye CUDA/cuDNN y conserva CPUExecutionProvider como
+# respaldo. El modelo facial se descarga una vez antes de la primera demo.
+onnxruntime-gpu[cuda,cudnn]==1.29.0
 
-# --- Vision por computador y OCR ---
-opencv-contrib-python==5.0.0.93
+# --- Vision por computador, reconocimiento facial y OCR ---
+insightface==1.0.1
+opencv-python==5.0.0.93
 numpy==2.5.1
 imutils==0.5.4
 pytesseract==0.3.13

@@ -4,6 +4,10 @@ import os
 import queue
 import tempfile
 import threading
+import json
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import pyttsx3
 from gtts import gTTS
@@ -21,10 +25,17 @@ except ImportError:  # pragma: no cover - dependencias opcionales
 PYGAME_TICK_HZ = 20
 
 
+class ElevenLabsRequestError(RuntimeError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"ElevenLabs HTTP {status_code}: {detail}")
+        self.status_code = status_code
+
+
 class TTS:
     """
     Motor TTS con cola y eventos:
-      - gTTS (online, principal)
+      - ElevenLabs (online, principal si hay API key)
+      - gTTS (online, respaldo)
       - pyttsx3 (voces del sistema, respaldo offline)
     Publica eventos "tts:start" / "tts:end" y "ui:print" para errores.
     """
@@ -37,6 +48,7 @@ class TTS:
 
         self._engine: pyttsx3.Engine | None = None
         self._engine_lock = threading.RLock()
+        self._elevenlabs_disabled = False
 
         self._play_lock = threading.RLock()
         self._mixer_ready = threading.Event()
@@ -84,12 +96,36 @@ class TTS:
             logger.debug(f"TTS procesando: {text}")
             self._speaking.set()
             event_bus.publish("tts:start")
-            # 1) gTTS (online)
-            self._speak_with_gtts(text)
-        except Exception as e_gtts:
-            logger.warning(f"gTTS falló, intentando pyttsx3: {e_gtts}")
+            elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+            if elevenlabs_key and not self._elevenlabs_disabled:
+                try:
+                    # 1) Voz neuronal, si el usuario configuro la API.
+                    self._speak_with_elevenlabs(text)
+                    return
+                except Exception as e_elevenlabs:
+                    if isinstance(e_elevenlabs, ElevenLabsRequestError) and e_elevenlabs.status_code in {
+                        401,
+                        402,
+                        403,
+                        404,
+                    }:
+                        # Estos estados no se resuelven reintentando cada frase.
+                        # Se vuelve a comprobar al reiniciar OJOZ.
+                        self._elevenlabs_disabled = True
+                    logger.warning(
+                        "ElevenLabs fallo, intentando gTTS: %s",
+                        e_elevenlabs,
+                    )
+
             try:
-                # 2) pyttsx3 (offline, voces del sistema)
+                # 2) gTTS online.
+                self._speak_with_gtts(text)
+                return
+            except Exception as e_gtts:
+                logger.warning("gTTS fallo, intentando pyttsx3: %s", e_gtts)
+
+            try:
+                # 3) pyttsx3 (offline, voces del sistema).
                 self._speak_with_pyttsx3(text)
             except Exception as e_pyttsx3:
                 logger.error(
@@ -110,6 +146,78 @@ class TTS:
     # -----------------------------
     # Motores específicos
     # -----------------------------
+    def _speak_with_elevenlabs(self, text: str) -> None:
+        """Genera MP3 con ElevenLabs sin guardar la clave en el proyecto."""
+        api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+        voice_id = os.environ.get("ELEVENLABS_VOICE_ID", "").strip()
+        if not api_key:
+            raise RuntimeError("Falta ELEVENLABS_API_KEY")
+        if not voice_id:
+            raise RuntimeError("Falta ELEVENLABS_VOICE_ID")
+
+        model_id = os.environ.get(
+            "ELEVENLABS_MODEL",
+            getattr(tts_config, "elevenlabs_model", "eleven_flash_v2_5"),
+        ).strip()
+        endpoint = (
+            "https://api.elevenlabs.io/v1/text-to-speech/"
+            f"{quote(voice_id, safe='')}?output_format=mp3_44100_128"
+        )
+        payload = json.dumps(
+            {
+                "text": text,
+                "model_id": model_id,
+                "language_code": "es",
+            }
+        ).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=payload,
+            headers={
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urlopen(
+                request,
+                timeout=getattr(tts_config, "elevenlabs_timeout_seconds", 15.0),
+            ) as response:
+                audio = response.read()
+        except HTTPError as exc:
+            detail = f"HTTP {exc.code}"
+            try:
+                body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                api_detail = body.get("detail", {})
+                if isinstance(api_detail, dict):
+                    detail = api_detail.get("code") or api_detail.get("message") or detail
+                elif api_detail:
+                    detail = str(api_detail)
+            except (ValueError, OSError):
+                pass
+            raise ElevenLabsRequestError(exc.code, detail) from exc
+        except URLError as exc:
+            raise RuntimeError("No se pudo conectar con ElevenLabs") from exc
+
+        if not audio:
+            raise RuntimeError("ElevenLabs devolvio audio vacio")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp_path = tmp.name
+        try:
+            tmp.write(audio)
+            tmp.close()
+            self._play_with_pygame(tmp_path)
+        finally:
+            try:
+                tmp.close()
+            except Exception:
+                pass
+            self._safe_remove(tmp_path)
+
     def _speak_with_gtts(self, text: str) -> None:
         """
         gTTS: requiere internet para cada texto.
@@ -193,7 +301,7 @@ class TTS:
         if not sound_path:
             return
         if not os.path.isfile(sound_path):
-            logger.info(f"Sonido de inicio no encontrado en {sound_path}. Coloca el archivo antes de iniciar.")
+            logger.debug(f"Sonido de inicio no encontrado en {sound_path}. Coloca el archivo antes de iniciar.")
             return
         played_any = False
         for _ in range(3):

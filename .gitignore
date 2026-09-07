@@ -12,6 +12,9 @@ data/fotos/
 data/modelos/
 data/ocr/
 
+# Modelos preentrenados de InsightFace (buffalo_l ocupa cientos de MB).
+assets/models/insightface/
+
 # Material audiovisual pesado que no usa la aplicacion (los assets que si se
 # cargan en tiempo de ejecucion, como assets/images y assets/sounds, si se versionan).
 assets/gifs/OJOZIntro.gif
@@ -24,3 +27,7 @@ test_cam_*.jpg
 *.bak
 *.new
 temp_backup/
+
+.env
+.env.*
+!.env.example

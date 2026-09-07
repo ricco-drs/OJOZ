@@ -78,7 +78,7 @@ class _Denoiser:
                 opts.inter_op_num_threads = 1
                 opts.log_severity_level = 3  # silencia avisos informativos
 
-                logger.info("Cargando modelo de supresión de ruido (DTLN)...")
+                logger.debug("Cargando modelo de supresión de ruido (DTLN)...")
                 sessions = [
                     ort.InferenceSession(str(p), opts, providers=["CPUExecutionProvider"])
                     for p in paths
@@ -90,7 +90,7 @@ class _Denoiser:
                 self._io1 = tuple(i.name for i in self._stage1.get_inputs())[:2]
                 self._io2 = tuple(i.name for i in self._stage2.get_inputs())[:2]
 
-                logger.info("Modelo de supresión de ruido listo.")
+                logger.debug("Modelo de supresión de ruido listo.")
                 return True
 
             except ImportError as exc:
@@ -115,7 +115,7 @@ class _Denoiser:
         no espere durante la conversación.
         """
         if not stt_config.denoise_enabled:
-            logger.info("Supresión de ruido deshabilitada por configuración.")
+            logger.debug("Supresión de ruido deshabilitada por configuración.")
             return False
         if not self._load():
             return False

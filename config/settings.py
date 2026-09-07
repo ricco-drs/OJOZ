@@ -13,9 +13,12 @@ from typing import Optional
 class TTSConfig:
     # Nombre de voz (opcional). Ej.: "Microsoft Sabina Desktop" en Windows
     voice: Optional[str] = None
+    language: str = "es"
     rate: int = 180
     volume: float = 1.0
     edge_voice: str = "es-MX-DaliaNeural"
+    elevenlabs_model: str = "eleven_flash_v2_5"
+    elevenlabs_timeout_seconds: float = 15.0
 
 
 def _env_float(name: str, default: float) -> float:
@@ -35,6 +38,17 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in ("1", "true", "t", "yes", "y", "si", "sí", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    """Lee un entero de una variable de entorno; si no es válido, usa el default."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -112,7 +126,7 @@ class LLMConfig:
     """
 
     enabled: bool = False
-    model: str = "claude-opus-5"
+    model: str = "claude-sonnet-5"
     max_tokens: int = 1024          # las respuestas son habladas, no hacen falta más
     effort: str = "low"             # prioriza la fluidez de la conversación
     timeout_seconds: float = 20.0   # antes que hacer esperar, se usa el respaldo
@@ -163,77 +177,6 @@ def _apply_env_overrides() -> None:
 _apply_env_overrides()
 
 
-# ===========================
-# VISIÓN
-# ===========================
-_HAAR_FILENAME = "haarcascade_frontalface_default.xml"
-
-
-def _haar_candidates() -> list[Path]:
-    """Posibles ubicaciones del clasificador Haar, en orden de preferencia."""
-    candidates: list[Path] = []
-
-    # 1) Ruta indicada explícitamente por el usuario.
-    env_path = os.environ.get("HAARCASCADE_PATH")
-    if env_path:
-        candidates.append(Path(env_path))
-
-    # 2) Copia local dentro del proyecto (assets/haarcascades/).
-    candidates.append(Path(__file__).resolve().parents[1] / "assets" / "haarcascades" / _HAAR_FILENAME)
-
-    # 3) La que trae OpenCV. Ojo: OpenCV 5 ya no distribuye estos XML,
-    #    por lo que la carpeta puede existir pero estar vacía.
-    try:
-        import cv2 as _cv2
-
-        candidates.append(Path(_cv2.data.haarcascades) / _HAAR_FILENAME)
-    except Exception:
-        pass
-
-    return candidates
-
-
-def _haar_default_path() -> str:
-    """
-    Devuelve la ruta del clasificador Haar frontal.
-
-    Si no se encuentra en ninguna ubicación conocida se devuelve el nombre
-    del archivo a secas; load_face_detector() se encargará de avisar con un
-    error claro en vez de fallar en silencio.
-    """
-    for candidate in _haar_candidates():
-        if candidate.is_file():
-            return str(candidate)
-    return _HAAR_FILENAME
-
-
-def load_face_detector():
-    """
-    Crea el CascadeClassifier de rostros validando que se haya cargado.
-
-    cv2.CascadeClassifier() no lanza excepción si el XML no existe: devuelve un
-    clasificador vacío que nunca detecta nada, lo que hace que el enrolamiento y
-    la autenticación fallen sin ningún mensaje. Aquí se comprueba de forma
-    explícita y se explica cómo resolverlo.
-    """
-    import cv2
-
-    detector = cv2.CascadeClassifier(vision.face_detector)
-    if detector.empty():
-        buscadas = "\n  - ".join(str(c) for c in _haar_candidates())
-        raise RuntimeError(
-            "No se pudo cargar el clasificador de rostros "
-            f"'{_HAAR_FILENAME}'.\n"
-            f"Rutas consultadas:\n  - {buscadas}\n"
-            "OpenCV 5 ya no incluye estos archivos. Soluciones:\n"
-            "  a) Copiar el XML en assets/haarcascades/ (se descarga del repo "
-            "opencv/data/haarcascades).\n"
-            "  b) Indicar su ruta con la variable de entorno HAARCASCADE_PATH.\n"
-            "  c) Instalar OpenCV 4.x, que sí lo distribuye."
-        )
-    return detector
-
-
 @dataclass
 class VisionConfig:
     # Rutas base
@@ -242,17 +185,32 @@ class VisionConfig:
     fotos_dir: Path
     modelos_dir: Path
     model_file: Path
+    insightface_root: Path
     ocr_dir: Path       # carpeta para capturas OCR
     currency_dir: Path  # carpeta de referencias de billetes
 
-    # Dispositivo de cámara y parámetros
+    # Dispositivo de camara y enrolamiento
     camera_index: int = 0
-    capture_count: int = 300
-    face_size: tuple[int, int] = (120, 120)
+    # Gira el video si la camara entrega horizontal aunque se sostenga en
+    # vertical (comun con el celular como webcam via apps tipo iVCam).
+    # Valores: 0, 90, 180 o 270.
+    camera_rotate_degrees: int = 0
+    capture_count: int = 20
+    min_enrollment_photos: int = 10
+    capture_frame_width: int = 960
+    capture_interval_seconds: float = 0.25
+    capture_timeout_seconds: float = 60.0
 
-    # Detección y reconocimiento
-    face_detector: str = _haar_default_path()
-    lbph_threshold: int = 70
+    # SCRFD detecta y alinea; ArcFace genera embeddings de 512 dimensiones.
+    face_model_name: str = "buffalo_l"
+    face_provider: str = "auto"
+    face_detection_size: tuple[int, int] = (640, 640)
+    face_detection_threshold: float = 0.65
+    face_min_size: int = 120
+    face_blur_threshold: float = 50.0
+    face_similarity_threshold: float = 0.50
+    face_ambiguity_margin: float = 0.05
+    face_required_confirmations: int = 3
 
     # UI / depuración
     show_preview: bool = True  # ventanas (imshow) durante captura/autenticación
@@ -265,7 +223,8 @@ _FOTOS_DIR = _DATA_DIR / "fotos"
 _MODELOS_DIR = _DATA_DIR / "modelos"
 _OCR_DIR = _DATA_DIR / "ocr"
 _CURRENCY_DIR = _DATA_DIR / "currency_refs"
-_MODEL_FILE = _MODELOS_DIR / "modeloLBPHFace.xml"
+_MODEL_FILE = _MODELOS_DIR / "arcface_gallery.npz"
+_INSIGHTFACE_ROOT = _BASE_DIR / "assets" / "models" / "insightface"
 _STARTUP_SOUND_DIR = _BASE_DIR / "assets" / "sounds"
 _STARTUP_SOUND_WAV = _STARTUP_SOUND_DIR / "dog_bark.wav"
 _STARTUP_SOUND_MP3 = _STARTUP_SOUND_DIR / "dog_bark.mp3"
@@ -275,6 +234,7 @@ os.makedirs(_FOTOS_DIR, exist_ok=True)
 os.makedirs(_MODELOS_DIR, exist_ok=True)
 os.makedirs(_OCR_DIR, exist_ok=True)
 os.makedirs(_CURRENCY_DIR, exist_ok=True)
+os.makedirs(_INSIGHTFACE_ROOT, exist_ok=True)
 os.makedirs(_STARTUP_SOUND_DIR, exist_ok=True)
 
 if config.startup_sound_path is None:
@@ -326,10 +286,14 @@ vision = VisionConfig(
     ocr_dir=_OCR_DIR,
     currency_dir=_CURRENCY_DIR,
     model_file=_MODEL_FILE,
-    camera_index=0,
-    capture_count=300,
-    face_size=(120, 120),
-    face_detector=_haar_default_path(),
-    lbph_threshold=70,
+    insightface_root=_INSIGHTFACE_ROOT,
+    camera_index=_env_int("OJOZ_CAMERA_INDEX", 0),
+    camera_rotate_degrees=_env_int("OJOZ_CAMERA_ROTATE", 0),
+    capture_count=20,
+    min_enrollment_photos=10,
+    capture_frame_width=960,
+    face_model_name=os.environ.get("OJOZ_FACE_MODEL", "buffalo_l"),
+    face_provider=os.environ.get("OJOZ_FACE_PROVIDER", "auto"),
+    face_similarity_threshold=_env_float("OJOZ_FACE_THRESHOLD", 0.50),
     show_preview=True,
 )

@@ -143,20 +143,20 @@ class OJOZApp:
             "=== INICIO ENROLAMIENTO:",
             "Carpeta de captura:",
             "Capturadas",
-            "/300 fotos",
+            "fotos validas",
             "Enrollment registrado con id=",
             "Se capturaron",
-            "rostros. Entrenando modelo",
-            "Iniciando entrenamiento del modelo",
+            "rostros. Creando galeria facial",
+            "Generando embeddings ArcFace",
             "Procesando",
-            "Iniciando captura de 300 rostros",
+            "Iniciando captura de 20 rostros",
             "Captura finalizada:",
             "Captura completada:",
-            "Registradas 300 fotos en la BD",
+            "fotos en la BD",
             "imagenes de",
             "Cargadas",
             "imagenes validas de",
-            "Entrenando modelo con",
+            "Galeria ArcFace",
             "rostros de",
             "personas",
             "Modelo guardado exitosamente en:",
@@ -441,7 +441,7 @@ class OJOZApp:
                     ft.Icon(ft.Icons.VISIBILITY, color="#C9762E", size=40),
                     ft.Column([
                         ft.Text(
-                            "OJOZ - Perro Guía",
+                            "OJOZ",
                             size=42,
                             weight=ft.FontWeight.W_900,
                             color="#F28D35",
@@ -453,7 +453,7 @@ class OJOZApp:
                         ),
                         ft.Text(
                             "Asistente de Visión Artificial",
-                            size=14,
+                            size=20,
                             color="#D3833C",
                             weight=ft.FontWeight.W_500,
                             font_family="Segoe UI",
@@ -671,27 +671,10 @@ class OJOZApp:
                             ),
                             ft.Container(height=10),
                             ft.Column([
-                                ft.Row([
-                                    ft.Icon(ft.Icons.DESCRIPTION, color="#F2B33D", size=20),
-                                    ft.Text("Lectura de documentos mediante OCR", size=14, color="#ffffff"),
-                                ], spacing=10),
-                                ft.Row([
-                                    ft.Icon(ft.Icons.PAYMENTS, color="#F2B33D", size=20),
-                                    ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff"),
-                                ], spacing=10),
-                                ft.Row([
-                                    ft.Icon(ft.Icons.EVENT, color="#F2B33D", size=20),
-                                    ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff"),
-                                ], spacing=10),
-                            ], spacing=8),
-                            ft.Container(height=15),
-                            ft.Row([
-                                ft.Text(
-                                    "Habla cuando termine de presentarme para comenzar",
-                                    size=13,
-                                    color="#F2B33D",
-                                    weight=ft.FontWeight.W_500,
-                                ),
+                                ft.Text("Lectura de documentos", size=14, color="#ffffff"),
+                                ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff"),
+                                ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff"),
+                                ft.Text("Todo en uno", size=14, color="#ffffff"),
                             ], spacing=8),
                         ], spacing=0),
                         bgcolor="transparent",
@@ -712,7 +695,7 @@ class OJOZApp:
                 offset=ft.Offset(0, 10),
             ),
         )
-        
+
         # Agregar la carta de presentación al chat
         if self.chat_messages:
             self.chat_messages.controls.append(presentation_card)
@@ -721,12 +704,11 @@ class OJOZApp:
                 page.update()
             except:
                 pass
-        
+
         # Layout principal con degradado de fondo (solo los 3 colores solicitados)
         main_container = ft.Container(
             content=ft.Column([
                 header,
-                status_bar,
                 chat_container,  # Ya tiene expand=True dentro
                 camera_container,
             ], spacing=0, expand=True),

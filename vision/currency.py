@@ -1,6 +1,8 @@
 # app/vision/currency.py
 from __future__ import annotations
 
+import base64
+import os
 import time
 import threading
 import queue
@@ -12,7 +14,8 @@ import numpy as np
 import pytesseract
 
 # Config de vision (indice de camara, rutas) y ruta de Tesseract, ambas centralizadas.
-from app.config.settings import configure_tesseract, vision
+from app.config.settings import configure_tesseract, llm as llm_config, vision
+from app.vision.camera import rotate_frame
 
 configure_tesseract()
 
@@ -211,7 +214,133 @@ def _match_with_templates(gray_img: np.ndarray) -> Tuple[Optional[str], Optional
     return best_currency, best_value, best_score
 
 
+def _claude_vision_currency(frame: np.ndarray) -> Tuple[bool, Optional[str], Optional[float], Optional[float]]:
+    """
+    Identifica el billete/moneda pidiendole a Claude que reconozca el diseno
+    completo (color, tamano, motivos), en vez de leer un numero impreso con
+    Tesseract o comparar contra plantillas ORB limitadas.
+    """
+    from app.utils.logger import logger
+
+    try:
+        import anthropic
+    except ImportError:
+        return False, None, None, None
+
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        return False, None, None, None
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=llm_config.model,
+            max_tokens=20,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": base64.b64encode(buffer.tobytes()).decode("ascii"),
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Esta foto muestra un billete o moneda de sol peruano (PEN). "
+                                "Identifica el tipo y el valor exacto. Responde UNICAMENTE en "
+                                "este formato, sin nada mas alrededor: billete|VALOR o "
+                                "moneda|VALOR (por ejemplo: billete|20 o moneda|5). Los valores "
+                                "posibles son 1, 2, 5, 10, 20, 50, 100, 200. Si no puedes "
+                                "identificarlo con certeza, responde unicamente: NINGUNO"
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(f"Claude Vision fallo para dinero, se usa OCR local: {exc}")
+        return False, None, None, None
+
+    raw = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+
+    if not raw or raw.upper() == "NINGUNO":
+        return False, None, None, None
+
+    try:
+        tipo, valor_str = raw.split("|", 1)
+        valor = float("".join(ch for ch in valor_str if ch.isdigit() or ch == "."))
+    except (ValueError, IndexError):
+        logger.debug(f"Respuesta de Claude Vision no reconocida: {raw!r}")
+        return False, None, None, None
+
+    if valor not in ALL_BILL_VALUES:
+        return False, None, None, None
+
+    return True, "PEN", valor, 92.0
+
+
+def _detect_currency_with_claude(seconds: float) -> Tuple[bool, Optional[str], Optional[float], Optional[float]]:
+    """
+    Abre la camara, muestra el preview y manda la mejor foto a Claude Vision.
+    Sin ANTHROPIC_API_KEY no abre la camara: se cae al flujo de OCR+plantillas.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return False, None, None, None
+
+    cap = cv2.VideoCapture(getattr(vision, "camera_index", 0), cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        return False, None, None, None
+
+    frame = None
+    try:
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            ret, current = cap.read()
+            if not ret:
+                break
+            frame = rotate_frame(current)
+            if getattr(vision, "show_preview", False):
+                show = current.copy()
+                time_left = int(seconds - (time.time() - t0)) + 1
+                cv2.putText(
+                    show,
+                    f"Muestre el billete o moneda - {time_left}s",
+                    (40, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.1,
+                    (0, 255, 0),
+                    3,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("Deteccion de Dinero", show)
+                if cv2.waitKey(1) & 0xFF == 27:
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    if frame is None:
+        return False, None, None, None
+
+    return _claude_vision_currency(frame)
+
+
 def detect_currency_best_frame(seconds: float = 8.0) -> Tuple[bool, Optional[str], Optional[float], Optional[float]]:
+    # Primero Claude Vision (reconocimiento visual del diseno completo); si no
+    # hay clave configurada o falla, se sigue con OCR de digitos + plantillas.
+    claude_result = _detect_currency_with_claude(seconds=min(seconds, 8.0))
+    if claude_result[0]:
+        return claude_result
+    return _detect_currency_ocr_orb(seconds=seconds)
+
+
+def _detect_currency_ocr_orb(seconds: float = 8.0) -> Tuple[bool, Optional[str], Optional[float], Optional[float]]:
     cap = cv2.VideoCapture(getattr(vision, "camera_index", 0), cv2.CAP_DSHOW)
     if not cap.isOpened():
         print("No se pudo abrir la camara para detectar billetes.")
@@ -346,6 +475,7 @@ def detect_currency_best_frame(seconds: float = 8.0) -> Tuple[bool, Optional[str
             ret, frame = cap.read()
             if not ret:
                 break
+            frame = rotate_frame(frame)
 
             if frame_queue.full():
                 try:
