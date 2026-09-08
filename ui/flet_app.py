@@ -656,7 +656,7 @@ class OJOZApp:
                                 ft.Text("Lectura de documentos", size=14, color="#ffffff", font_family="Poppins"),
                                 ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff", font_family="Poppins"),
                                 ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff", font_family="Poppins"),
-                                ft.Text("Todo en uno", size=14, color="#ffffff", font_family="Poppins"),
+                                ft.Text("Descripción del entorno", size=14, color="#ffffff", font_family="Poppins"),
                             ], spacing=8),
                         ], spacing=0),
                         bgcolor="transparent",

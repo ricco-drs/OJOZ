@@ -24,6 +24,7 @@ def infer_intent(text: str) -> Optional[str]:
     - "read_image"        (Opcion 1 - OCR, menu autenticado)
     - "currency_value"    (Opcion 2 - dinero)
     - "verify_expiry"     (Opcion 3 - vencimiento)
+    - "describe_scene"    (describir personas/obstaculos/entorno)
     """
     t = _normalize(text)
 
@@ -65,8 +66,32 @@ def infer_intent(text: str) -> Optional[str]:
     if "opcion 3" in t or "opcion tres" in t or "opcion numero tres" in t:
         return "verify_expiry"
 
+    # Describir escena: personas, obstaculos, entorno
+    if any(
+        phrase in t
+        for phrase in [
+            "hay alguien",
+            "hay personas",
+            "hay una persona",
+            "hay algo en frente",
+            "hay algun obstaculo",
+            "hay obstaculos",
+            "que ves",
+            "que estas viendo",
+            "que hay en frente",
+            "que hay alrededor",
+            "describe el entorno",
+            "describir el entorno",
+            "describe lo que ves",
+        ]
+    ):
+        return "describe_scene"
+
     # Frases alternativas para OCR
     if "leer" in t and any(k in t for k in ["documento", "texto", "imagen"]):
+        return "read_image"
+    # "tengo un documento, de que trata / que dice / que contiene"
+    if "documento" in t and any(k in t for k in ["trata", "dice", "contiene", "dice ahi"]):
         return "read_image"
     if any(
         phrase in t

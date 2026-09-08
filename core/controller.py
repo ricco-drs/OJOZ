@@ -24,6 +24,8 @@ from app.vision.ocr import read_text_best_frame
 from app.vision.currency import detect_currency_best_frame
 # === EXPIRY (Opción 3) ===
 from app.vision.expiry import check_expiry_best_frame
+# === ESCENA (descripción independiente) ===
+from app.vision.scene import describe_scene_best_frame
 
 from app.core.router import infer_intent
 from app.core.llm_agent import LLMAgent
@@ -64,6 +66,11 @@ class Controller:
         # Para Opción 3 (Expiry/Vencimiento)
         self._pending_expiry_after_tts: bool = False
         self._expiry_capture_seconds: float | None = None
+        # Para describir escena (funcion suelta, fuera del menu numerado)
+        self._pending_describe_scene_after_tts: bool = False
+        # Identificacion por rostro antes de preguntar nombre (evita choques
+        # de nombres repetidos: el rostro decide si es alguien nuevo o no).
+        self._pending_identify_after_tts: bool = False
 
         # Opción B: conversación conducida por un modelo de lenguaje. Si está
         # desactivada o no puede atender, se usa el flujo por palabras clave.
@@ -114,12 +121,28 @@ class Controller:
             except (TypeError, ValueError):
                 return 10.0
 
+        def identificar_usuario() -> str:
+            self.tts.join()
+            try:
+                ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
+            except FileNotFoundError:
+                ok, recognized_name, conf = False, None, None
+            if ok and recognized_name:
+                self._user_name = recognized_name
+                self._authenticated = True
+                return f"Se reconoció a {recognized_name}. Ya está identificado y puede usar las funciones."
+            return (
+                "No se reconoció ningún rostro conocido: es una persona nueva. "
+                "Pregúntale su nombre y usa registrar_usuario para crearle una cuenta."
+            )
+
         def registrar_usuario(nombre: str) -> str:
             nombre = self._extract_name(nombre) or nombre
             if not nombre:
                 return "No se entendió el nombre. Pídeselo de nuevo."
-            if dao.user_exists(nombre):
-                return f"{nombre} ya tiene una cuenta; usa autenticar_usuario para verificar su identidad."
+            # No se comprueba si el nombre ya existe: la identidad la decide el
+            # rostro (identificar_usuario), no el nombre, asi que dos personas
+            # pueden llamarse igual sin chocar.
             self.tts.join()
             return self._enroll_workflow(nombre, llm_mode=True)
 
@@ -127,8 +150,6 @@ class Controller:
             nombre = self._extract_name(nombre) or nombre
             if not nombre:
                 return "No se entendió el nombre. Pídeselo de nuevo."
-            if not dao.user_exists(nombre):
-                return f"No hay ninguna cuenta a nombre de {nombre}. Ofrécele registrarse."
             self._user_name = nombre
             self.tts.join()
             return self._auth_workflow(llm_mode=True)
@@ -151,6 +172,12 @@ class Controller:
             self.tts.join()
             return self._expiry_workflow(capture_seconds=_segundos_validos(segundos), llm_mode=True)
 
+        def describir_escena() -> str:
+            if (error := _sesion_iniciada()) is not None:
+                return error
+            self.tts.join()
+            return self._describe_scene_workflow(llm_mode=True)
+
         def cerrar_sesion() -> str:
             nombre = self._user_name or "la persona"
             self._user_name = None
@@ -172,11 +199,13 @@ class Controller:
             return "La aplicación se está cerrando. Despídete en una frase."
 
         return {
+            "identificar_usuario": identificar_usuario,
             "registrar_usuario": registrar_usuario,
             "autenticar_usuario": autenticar_usuario,
             "leer_documento": leer_documento,
             "identificar_dinero": identificar_dinero,
             "verificar_vencimiento": verificar_vencimiento,
+            "describir_escena": describir_escena,
             "cerrar_sesion": cerrar_sesion,
             "cerrar_aplicacion": cerrar_aplicacion,
         }
@@ -424,7 +453,8 @@ class Controller:
             self.speak(f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?")
             return
 
-        self.speak("Hola, soy OJOZ, tu asistente. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+        self.speak("Hola, soy OJOZ, tu asistente. Mírame a la cámara para identificarte.")
+        self._pending_identify_after_tts = True
 
     def speak(self, text: str) -> None:
         """Envía texto a TTS (el gate de STT lo gestiona tts:start/tts:end o el watchdog)."""
@@ -482,6 +512,18 @@ class Controller:
             threading.Thread(target=self._expiry_workflow, args=(capture_seconds,), daemon=True).start()
             return  # no rearmar escucha; el workflow maneja el audio
 
+        # Describir escena: "¿hay personas?", "¿qué ves?"
+        if self._pending_describe_scene_after_tts:
+            self._pending_describe_scene_after_tts = False
+            threading.Thread(target=self._describe_scene_workflow, daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
+        # Identificación por rostro (arranque o reinicio de flujo)
+        if self._pending_identify_after_tts:
+            self._pending_identify_after_tts = False
+            threading.Thread(target=self._identify_workflow, daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
         # Si no hay workflows pendientes, reactivar escucha normalmente
         self._enable_listening_after_delay()
 
@@ -505,7 +547,16 @@ class Controller:
         reply = None
 
 
-        if self._conversation_state == "waiting_new_user_name":
+        if self._conversation_state == "waiting_identify_name":
+            # No reconocimos el rostro: quien sea, se le crea una cuenta nueva
+            # con este nombre, sin comprobar si ya existe alguien con el mismo
+            # nombre (la identidad la decide el rostro, no el nombre).
+            self._user_name = self._extract_name(text)
+            self._conversation_state = None
+            self._pending_enroll_after_tts = True
+            reply = f"{self._user_name}, mire a la cámara. Vamos a crearte una cuenta."
+
+        elif self._conversation_state == "waiting_new_user_name":
             lower = (text or "").lower()
             if self._is_existing_user_utterance(lower):
                 # Corrige: dijo que ya tiene cuenta, cambiar al flujo de usuario recurrente
@@ -728,8 +779,10 @@ class Controller:
             def _restart_flow():
                 time.sleep(1.5)  # Esperar un poco después de la despedida
                 # Saludo corto: la presentacion completa solo se da una vez,
-                # al arrancar la app (ver start()), no en cada reinicio de sesion.
-                self.speak("¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?")
+                # al arrancar la app (ver start()). Identifica por rostro antes
+                # de preguntar nada, igual que al arrancar la app.
+                self.speak("¡Hola! Mírame a la cámara para identificarte.")
+                self._pending_identify_after_tts = True
 
             threading.Thread(target=_restart_flow, daemon=True).start()
             # Devolver el mensaje de despedida (lo dirá _on_stt_text)
@@ -749,7 +802,10 @@ class Controller:
             return "Ok, cerrando la aplicación. Hasta luego!"
 
         if intent == "greet":
-            return "¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?"
+            if self._authenticated and self._user_name:
+                return f"Hola de nuevo, {self._user_name}. ¿Qué opción deseas?"
+            self._pending_identify_after_tts = True
+            return "Hola, mírame a la cámara para identificarte."
 
         if intent == "show_menu":
             # Mostrar menú de opciones disponibles
@@ -759,6 +815,7 @@ class Controller:
                     "1. Leer lo que aparece en la cámara.\n"
                     "2. Decirte el valor del dinero que me estés mostrando.\n"
                     "3. Revisar la fecha de vencimiento de un producto.\n"
+                    "También puedo describirte lo que ve la cámara si me lo pides.\n"
                     f"¿Qué opción deseas, {self._user_name}?"
                 )
             else:
@@ -810,6 +867,14 @@ class Controller:
                 # Lanza la verificación de vencimiento tras terminar el mensaje de TTS
                 self._pending_expiry_after_tts = True
                 return "Entendido, muestre la fecha de vencimiento del producto a la camara."
+            else:
+                return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
+
+        # ===== Describir escena (fuera del menú numerado) =====
+        if intent == "describe_scene":
+            if self._authenticated and self._user_name:
+                self._pending_describe_scene_after_tts = True
+                return "Entendido, dejame ver lo que hay frente a la cámara."
             else:
                 return "Primero debes autenticarte. Di opcion 2 para iniciar sesion."
 
@@ -998,6 +1063,46 @@ class Controller:
             # La reactivación de STT se hará tras tts:end del mensaje final
             pass
         return ""
+
+    def _identify_workflow(self) -> None:
+        """
+        Reconocimiento facial abierto (sin nombre esperado): mira quién es
+        antes de preguntar nada. Si reconoce a alguien en la galería, entra
+        directo autenticado con su nombre guardado. Si no reconoce a nadie
+        (o aún no existe la galería), recién ahí pregunta el nombre para
+        registrar a una persona nueva.
+
+        Así el nombre deja de ser la llave de identidad: dos personas pueden
+        llamarse igual sin chocar, porque cada una es un rostro distinto.
+        """
+        from app.utils.logger import logger
+
+        try:
+            self.stt.enable_listening(False)
+            event_bus.publish("camera.opened", index=vision.camera_index)
+            event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
+
+            try:
+                ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
+            except FileNotFoundError:
+                ok, recognized_name, conf = False, None, None
+
+            event_bus.publish("camera.closed", index=vision.camera_index)
+            logger.debug(f"Identificación abierta: ok={ok}, nombre={recognized_name}, confianza={conf}")
+
+            if ok and recognized_name:
+                self._user_name = recognized_name
+                self._authenticated = True
+                event_bus.publish("ui:print", role="sys", text=f"[OK] Identidad reconocida: {recognized_name}")
+                self.speak(f"¡Hola de nuevo, {recognized_name}! ¿En qué puedo ayudarte?")
+            else:
+                self._conversation_state = "waiting_identify_name"
+                self.speak("No te reconocí. ¿Cómo quieres que te llame?")
+        except Exception as e:
+            logger.error(f"Error al identificar: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR IDENTIFICAR] {e}")
+            self._conversation_state = "waiting_identify_name"
+            self.speak("Tuve un problema para verificar tu identidad por ahora. ¿Cómo quieres que te llame?")
 
     def _auth_workflow(self, llm_mode: bool = False) -> str:
         """
@@ -1343,6 +1448,45 @@ class Controller:
             if llm_mode:
                 return f"La verificación falló: {e}"
             self.speak("Ocurrio un error al verificar la fecha de vencimiento.")
+        finally:
+            # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
+            pass
+        return ""
+
+    # ======== NUEVO: DESCRIBIR ESCENA ========
+    def _describe_scene_workflow(self, llm_mode: bool = False) -> str:
+        """
+        Describe el entorno que ve la cámara (personas, obstáculos, objetos)
+        con Claude Vision, como función suelta, sin pasar por documento/dinero/
+        vencimiento. Pensada para preguntas naturales como "¿hay personas?"
+        o "¿qué ves?".
+        """
+        from app.utils.logger import logger
+
+        try:
+            self.stt.enable_listening(False)
+            event_bus.publish("ui:print", role="sys", text="Analizando el entorno...")
+            if not llm_mode:
+                self.speak("Voy a describir lo que ve la cámara.")
+
+            ok, description = describe_scene_best_frame(seconds=5.0)
+
+            if ok and description:
+                self.speak(description)
+                event_bus.publish("ui:print", role="app/scene", text=description)
+                if llm_mode:
+                    return "Ya se le describió el entorno a la persona con el resultado literal."
+            else:
+                event_bus.publish("ui:print", role="sys", text="[FALLO] No pude describir el entorno")
+                if llm_mode:
+                    return "No se pudo describir el entorno (sin conexión o sin clave configurada)."
+                self.speak("No pude describir el entorno en este momento. Verifica tu conexión a internet.")
+        except Exception as e:
+            logger.error(f"Error al describir escena: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR ESCENA] {e}")
+            if llm_mode:
+                return f"La descripción falló: {e}"
+            self.speak("Ocurrio un error al describir el entorno.")
         finally:
             # La reactivacion de STT ocurrira despues del tts:end del mensaje anterior
             pass

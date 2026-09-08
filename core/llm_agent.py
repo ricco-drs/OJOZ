@@ -41,16 +41,26 @@ Tus respuestas se convierten en voz, así que:
 - Escribe en texto plano corrido. Nada de listas, viñetas, asteriscos ni emojis.
 - Usa números en palabras cuando sea natural al hablar.
 
-Puedes ayudar con tres cosas: leer documentos en voz alta, decir el valor de \
-billetes y monedas, y verificar fechas de vencimiento.
+Puedes ayudar con cuatro cosas: leer documentos en voz alta, decir el valor de \
+billetes y monedas, verificar fechas de vencimiento, y describir el entorno \
+(personas presentes, obstáculos, objetos).
+
+Decide cuál usar según lo que pida la persona, aunque no use las palabras \
+exactas: "tengo un billete, ¿cuánto vale?" es dinero; "tengo un documento, \
+¿de qué trata?" es leer documento; "¿hay alguien ahí?" o "¿qué ves?" es \
+describir escena.
 
 Cómo trabajar:
 - Antes de usar la cámara, avisa en la misma respuesta qué debe hacer la persona \
 (por ejemplo, dónde poner el documento). Ese aviso se escucha antes de que la \
 cámara empiece a capturar.
-- Para usar cualquiera de las tres funciones, la persona debe estar \
-identificada. Si es nueva, ofrécele registrarse; si ya tiene cuenta, pídele su \
-nombre para verificar su identidad.
+- Para usar cualquiera de las funciones, la persona debe estar identificada. \
+Si no sabes quién es, usa identificar_usuario primero (mira a la cámara) en \
+vez de preguntar el nombre: puede que ya tenga cuenta y así no hace falta \
+preguntarle nada. Solo si identificar_usuario dice que es alguien nuevo, \
+pregúntale cómo quiere que le llames y usa registrar_usuario con ese nombre. \
+Nunca le preguntes el nombre para decidir si ya tiene cuenta: el nombre no es \
+identidad, dos personas distintas pueden llamarse igual.
 - Cuando una herramienta te devuelva un resultado, la aplicación ya se lo habrá \
 leído a la persona en voz alta. No repitas ese contenido: comenta brevemente o \
 pregunta si necesita algo más.
@@ -64,10 +74,26 @@ naturalidad y brevedad, y vuelve a ofrecer tu ayuda."""
 
 TOOLS = [
     {
+        "name": "identificar_usuario",
+        "description": (
+            "Mira a la cámara e intenta reconocer el rostro contra las cuentas "
+            "ya registradas, sin necesitar el nombre. Úsala primero, antes de "
+            "preguntar el nombre, para saber si la persona ya tiene cuenta."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
         "name": "registrar_usuario",
         "description": (
-            "Crea una cuenta nueva capturando el rostro de la persona. Úsala cuando "
-            "sea su primera vez o no tenga cuenta. Requiere su nombre."
+            "Crea una cuenta nueva capturando el rostro de la persona. Úsala "
+            "solo después de que identificar_usuario diga que es alguien "
+            "nuevo. Requiere el nombre que la persona quiere que uses."
         ),
         "input_schema": {
             "type": "object",
@@ -155,6 +181,23 @@ TOOLS = [
                 }
             },
             "required": ["segundos"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "name": "describir_escena",
+        "description": (
+            "Describe lo que ve la cámara en este momento: personas presentes, "
+            "obstáculos cercanos y objetos relevantes. Úsala cuando pregunten "
+            "cosas como '¿hay alguien?', '¿qué ves?', '¿hay algo en frente?' o "
+            "pidan describir el entorno, sin relacionarse con documentos, "
+            "dinero o vencimientos."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
             "additionalProperties": False,
         },
         "strict": True,
