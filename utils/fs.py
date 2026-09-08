@@ -58,6 +58,12 @@ def _write_display_name(folder: Path, name: str) -> None:
         pass
 
 
+def write_display_name(folder: Path, name: str) -> None:
+    """Guarda el nombre visible de una carpeta que no fue creada por nombre
+    (p. ej. una carpeta identificada por ID de usuario)."""
+    _write_display_name(folder, name)
+
+
 def get_display_name(folder: Path) -> str:
     meta = folder / _DISPLAY_NAME_FILE
     if meta.exists():

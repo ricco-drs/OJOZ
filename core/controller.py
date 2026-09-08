@@ -1,8 +1,11 @@
 from __future__ import annotations
 import os
 import re
+import shutil
 import threading
 import time
+import uuid
+from pathlib import Path
 from typing import Literal
 
 from app.core.event_bus import event_bus
@@ -14,7 +17,7 @@ from app.config.settings import vision  # rutas/umbrales de visión
 from app.vision.face_capture import capture_faces
 from app.vision.face_train import train_dataset
 from app.vision.face_recognition import recognize_best_frame
-from app.utils.fs import user_folder as get_user_folder
+from app.utils.fs import write_display_name
 # ==== IMPORTS DE BASE DE DATOS ====
 from app.db import dao
 # ==========================
@@ -71,6 +74,11 @@ class Controller:
         # Identificacion por rostro antes de preguntar nombre (evita choques
         # de nombres repetidos: el rostro decide si es alguien nuevo o no).
         self._pending_identify_after_tts: bool = False
+        # Usuario nuevo: primero se captura el rostro, el apodo se pregunta
+        # despues (para no atarse a un nombre antes de tener las fotos).
+        self._pending_enroll_capture_after_tts: bool = False
+        self._pending_enroll_temp_folder: Path | None = None
+        self._pending_enroll_photo_count: int = 0
 
         # Opción B: conversación conducida por un modelo de lenguaje. Si está
         # desactivada o no puede atender, se usa el flujo por palabras clave.
@@ -229,9 +237,67 @@ class Controller:
     # -----------------------------
     def _extract_name(self, raw_text: str) -> str:
         """
-        Extrae un nombre propio desde frases naturales como
-        "me llamo Rico" o "mi nombre es Rico".
-        Si no reconoce ningn patrn, devuelve el texto tal cual.
+        Extrae el nombre propio de una respuesta natural a "como quieres que
+        te llame?", del estilo "quiero que me llames Juan", "dime Pedro" o
+        "me llamo Maria". Usa Claude para entender la frase sin depender de
+        una lista fija de patrones; si no hay clave configurada o la llamada
+        falla, cae al recorte por patrones conocidos de siempre.
+        """
+        text = (raw_text or "").strip()
+        if not text:
+            return text
+
+        via_claude = self._extract_name_with_claude(text)
+        if via_claude:
+            return via_claude
+
+        return self._extract_name_by_pattern(text)
+
+    def _extract_name_with_claude(self, raw_text: str) -> str | None:
+        """Le pide a Claude que saque solo el nombre de la frase completa."""
+        if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+            return None
+
+        try:
+            import anthropic
+        except ImportError:
+            return None
+
+        try:
+            client = anthropic.Anthropic()
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=20,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Alguien respondio esto a la pregunta de como quiere "
+                            f'que lo llamen: "{raw_text}". Responde UNICAMENTE '
+                            "con el nombre propio que dijo, tal cual lo dijo, sin "
+                            "nada mas alrededor. Si no dijo ningun nombre, "
+                            "responde unicamente: NINGUNO"
+                        ),
+                    }
+                ],
+            )
+        except Exception as exc:
+            from app.utils.logger import logger
+
+            logger.debug(f"Extraccion de nombre con Claude fallo, se usa el patron de siempre: {exc}")
+            return None
+
+        text = "".join(
+            b.text for b in response.content if getattr(b, "type", None) == "text"
+        ).strip()
+        if not text or text.upper() == "NINGUNO":
+            return None
+        return text
+
+    def _extract_name_by_pattern(self, raw_text: str) -> str:
+        """
+        Respaldo sin IA: recorta frases conocidas como "me llamo Rico" o "mi
+        nombre es Rico". Si no reconoce ningun patron, devuelve el texto tal cual.
         """
         text = (raw_text or "").strip()
         lowered = text.lower()
@@ -453,8 +519,7 @@ class Controller:
             self.speak(f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?")
             return
 
-        self.speak("Hola, soy OJOZ, tu asistente. Mírame a la cámara para identificarte.")
-        self._pending_identify_after_tts = True
+        self.speak("Hola, soy OJOZ, tu asistente. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
 
     def speak(self, text: str) -> None:
         """Envía texto a TTS (el gate de STT lo gestiona tts:start/tts:end o el watchdog)."""
@@ -524,6 +589,12 @@ class Controller:
             threading.Thread(target=self._identify_workflow, daemon=True).start()
             return  # no rearmar escucha; el workflow maneja el audio
 
+        # Usuario nuevo: captura el rostro antes de preguntar el apodo
+        if self._pending_enroll_capture_after_tts:
+            self._pending_enroll_capture_after_tts = False
+            threading.Thread(target=self._enroll_capture_workflow, daemon=True).start()
+            return  # no rearmar escucha; el workflow maneja el audio
+
         # Si no hay workflows pendientes, reactivar escucha normalmente
         self._enable_listening_after_delay()
 
@@ -547,7 +618,20 @@ class Controller:
         reply = None
 
 
-        if self._conversation_state == "waiting_identify_name":
+        if self._conversation_state == "waiting_new_user_nickname":
+            # Ya se capturo el rostro (vease _enroll_capture_workflow); ahora
+            # se guarda con el apodo que diga, sin comprobar si ya existe
+            # alguien con el mismo nombre (la carpeta se guarda por ID de
+            # usuario, nunca por nombre, asi que nunca chocan).
+            nombre = self._extract_name(text)
+            self._conversation_state = None
+            reply = self._finalize_enrollment(
+                nombre,
+                self._pending_enroll_temp_folder,
+                self._pending_enroll_photo_count,
+            )
+
+        elif self._conversation_state == "waiting_identify_name":
             # No reconocimos el rostro: quien sea, se le crea una cuenta nueva
             # con este nombre, sin comprobar si ya existe alguien con el mismo
             # nombre (la identidad la decide el rostro, no el nombre).
@@ -781,8 +865,7 @@ class Controller:
                 # Saludo corto: la presentacion completa solo se da una vez,
                 # al arrancar la app (ver start()). Identifica por rostro antes
                 # de preguntar nada, igual que al arrancar la app.
-                self.speak("¡Hola! Mírame a la cámara para identificarte.")
-                self._pending_identify_after_tts = True
+                self.speak("¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?")
 
             threading.Thread(target=_restart_flow, daemon=True).start()
             # Devolver el mensaje de despedida (lo dirá _on_stt_text)
@@ -804,8 +887,7 @@ class Controller:
         if intent == "greet":
             if self._authenticated and self._user_name:
                 return f"Hola de nuevo, {self._user_name}. ¿Qué opción deseas?"
-            self._pending_identify_after_tts = True
-            return "Hola, mírame a la cámara para identificarte."
+            return "¡Hola! ¿Eres usuario nuevo o ya tienes una cuenta registrada?"
 
         if intent == "show_menu":
             # Mostrar menú de opciones disponibles
@@ -826,18 +908,21 @@ class Controller:
             if self._authenticated and self._user_name:
                 self._pending_ocr_after_tts = True
                 return "Entendido, apunte la camara al documento para leerlo."
-            # Iniciar flujo de usuario nuevo → pedimos nombre
-            self._conversation_state = "waiting_new_user_name"
-            return "¿Me compartes tu nombre?"
+            # Usuario nuevo: primero se captura el rostro; el apodo se
+            # pregunta despues, ya con las fotos listas (evita atar el
+            # registro a un nombre que otra persona ya podria usar).
+            self._pending_enroll_capture_after_tts = True
+            return "Entendido, mírame a la cámara para capturar tu rostro."
 
         if intent == "returning_user_option":
             # Si ya está autenticado, interpretar como Opción 2 del menú
             if self._authenticated and self._user_name:
                 self._pending_currency_after_tts = True
                 return "Entendido, muestre el billete o moneda a la camara."
-            # Actualizado: opción 2 pide nombre para buscar en BD
-            self._conversation_state = "waiting_returning_user_name"
-            return "Que bueno tenerte de vuelta, cual es tu nombre para verificar identidad?"
+            # Ya tiene cuenta: se reconoce por rostro, sin pedir el nombre
+            # (asi el nombre nunca decide la identidad).
+            self._pending_identify_after_tts = True
+            return "Que bueno tenerte de vuelta, mírame a la cámara para reconocerte."
 
         if intent == "open_camera":
             # Mantengo tu intent original; ahora la cámara se usa en workflows.
@@ -964,95 +1049,58 @@ class Controller:
         """
         Captura fotos del usuario y actualiza la galeria de embeddings ArcFace.
 
+        Se captura en una carpeta temporal (sin nombre) y recien se asocia al
+        nombre en `_finalize_enrollment`, guardando por ID de usuario y no por
+        nombre: asi dos personas con el mismo nombre nunca comparten carpeta
+        ni se pisan las fotos entre si.
+
         En `llm_mode` no encadena los mensajes de bienvenida (los da el modelo) y
         devuelve un resumen. El alta de la sesión la marca este código, no el modelo.
         """
         from app.utils.logger import logger
-        from pathlib import Path
-
 
         try:
             # Bloquear escucha durante enrolamiento
             self.stt.enable_listening(False)
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros para {name}...")
-            
+
             logger.debug(f"=== INICIO ENROLAMIENTO: {name} ===")
 
-            # 1. Capturar fotos (todavia sin crear la cuenta: si falla, no debe
-            # quedar un usuario sin rostro registrado en la BD)
-            saved = capture_faces(name=name, count=vision.capture_count, show_preview=vision.show_preview)
+            temp_folder = vision.fotos_dir / f"_pendiente_{uuid.uuid4().hex[:10]}"
+            saved = capture_faces(count=vision.capture_count, show_preview=vision.show_preview, folder=temp_folder)
             logger.debug(f"Captura completada: {saved} fotos")
 
             if saved < vision.min_enrollment_photos:
+                shutil.rmtree(temp_folder, ignore_errors=True)
                 raise RuntimeError(
                     f"Se capturaron muy pocas fotos ({saved}). "
                     f"Se requieren al menos {vision.min_enrollment_photos}."
                 )
 
-            # 2. Recien con fotos validas, crear el usuario en la BD
-            user_id = dao.get_or_create_user(name)
-            logger.debug(f"Usuario en BD: id={user_id}, nombre={name}")
-
-            # 3. Registrar las fotos en la BD
-            user_folder = get_user_folder(name)
-            photo_files = sorted(user_folder.glob("rostro_*.jpg"))
-            photo_paths = [str(p.relative_to(vision.base_dir)) for p in photo_files]
-            
-            if photo_paths:
-                dao.replace_face_photos(user_id, photo_paths)
-                logger.debug(f"Registradas {len(photo_paths)} fotos en la BD")
-            
-            # 4. Registrar la sesión de enrolamiento
-            enrollment_id = dao.insert_enrollment(user_id, saved, notes=f"Captura automática de {saved} rostros")
-            logger.debug(f"Enrollment registrado con id={enrollment_id}")
-
-            # 5. Generar la galeria de embeddings
             event_bus.publish("ui:print", role="sys", text=f"Se capturaron {saved} rostros. Creando galeria facial...")
-            logger.debug("Generando embeddings ArcFace...")
-            
-            model_path = train_dataset()
-            logger.debug(f"Galeria ArcFace actualizada: {model_path}")
-
-            # 6. Registrar el modelo en la BD
-            model_relative = str(Path(model_path).relative_to(vision.base_dir))
-            model_id = dao.upsert_global_model(
-                file_path=model_relative,
-                threshold=vision.face_similarity_threshold,
-                version=vision.face_model_name,
-                model_type="ArcFace"
-            )
-            logger.debug(f"Modelo registrado en BD con id={model_id}")
-
+            mensaje = self._finalize_enrollment(name, temp_folder, saved)
             event_bus.publish("camera.closed", index=vision.camera_index)
-            if not llm_mode:
-                # Confirmar por voz
-                self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
-            event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
-            event_bus.publish("ui:print", role="sys", text=f"[OK] Modelo actualizado: {model_path}")
-            logger.debug(f"=== FIN ENROLAMIENTO EXITOSO: {name} ===")
 
             if llm_mode:
-                # La sesión se marca aquí, en el código: el modelo no decide quién
-                # está autenticado.
-                self._user_name = name
-                self._authenticated = True
-                self._conversation_state = None
-                return f"Cuenta creada para {name}, que ya queda identificado con {saved} fotos."
+                return mensaje
 
+            if not self._authenticated:
+                # _finalize_enrollment fallo (mensaje de error, sesion no marcada)
+                self.speak(mensaje)
+                return ""
 
             # Continuar el flujo sin regresar al saludo inicial
+            self.speak(f"Listo, {name}. Su cuenta ha sido creada satisfactoriamente.")
+
             def _continue_after_enroll():
                 time.sleep(1.5)  # Esperar un poco después del mensaje de confirmación
-                self._user_name = name
-                self._authenticated = True
-                self._conversation_state = None
                 self._pending_enroll_after_tts = False
                 self._pending_auth_after_tts = False
                 self.speak(f"Un gusto conocerte, {name}. ¿En qué puedo ayudarte?")
-            
+
             threading.Thread(target=_continue_after_enroll, daemon=True).start()
-            
+
         except Exception as e:
             logger.error(f"Error en enrolamiento: {e}", exc_info=True)
             event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
@@ -1063,6 +1111,113 @@ class Controller:
             # La reactivación de STT se hará tras tts:end del mensaje final
             pass
         return ""
+
+    def _enroll_capture_workflow(self) -> None:
+        """
+        Usuario nuevo: primero comprueba con una lectura rapida si ese rostro
+        ya esta en la galeria (por si dijo "nuevo" por error o ya se habia
+        registrado antes). Si ya tiene cuenta, lo avisa y lo deja identificado
+        sin duplicar el registro. Si no, recien ahi captura el rostro; el
+        apodo se pregunta despues, en `waiting_new_user_nickname`, y se llama
+        a `_finalize_enrollment` con las fotos ya listas.
+        """
+        from app.utils.logger import logger
+
+        try:
+            self.stt.enable_listening(False)
+            event_bus.publish("camera.opened", index=vision.camera_index)
+            event_bus.publish("ui:print", role="sys", text="Verificando si ya tienes una cuenta...")
+
+            try:
+                ya_existe, nombre_existente, _conf = recognize_best_frame(seconds=3.0, expected_name=None)
+            except FileNotFoundError:
+                ya_existe, nombre_existente = False, None
+
+            if ya_existe and nombre_existente:
+                event_bus.publish("camera.closed", index=vision.camera_index)
+                self._user_name = nombre_existente
+                self._authenticated = True
+                event_bus.publish("ui:print", role="sys", text=f"[OK] Ya tenia cuenta: {nombre_existente}")
+                self.speak(f"Ya tienes una cuenta, {nombre_existente}. ¿En qué puedo ayudarte?")
+                return
+
+            event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros...")
+
+            temp_folder = vision.fotos_dir / f"_pendiente_{uuid.uuid4().hex[:10]}"
+            saved = capture_faces(count=vision.capture_count, show_preview=vision.show_preview, folder=temp_folder)
+
+            event_bus.publish("camera.closed", index=vision.camera_index)
+
+            if saved < vision.min_enrollment_photos:
+                shutil.rmtree(temp_folder, ignore_errors=True)
+                self.speak(
+                    f"Se capturaron muy pocas fotos, se requieren al menos "
+                    f"{vision.min_enrollment_photos}. Intenta de nuevo diciendo "
+                    "que eres usuario nuevo."
+                )
+                return
+
+            self._pending_enroll_temp_folder = temp_folder
+            self._pending_enroll_photo_count = saved
+            self._conversation_state = "waiting_new_user_nickname"
+            self.speak("Listo, ya te tengo. ¿Cómo quieres que te llame?")
+        except Exception as e:
+            logger.error(f"Error en captura de enrolamiento: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+            self.speak("Hubo un problema durante la captura. Intente nuevamente.")
+
+    def _finalize_enrollment(self, name: str, temp_folder: Path | None, saved: int) -> str:
+        """
+        Crea el usuario (siempre nuevo, nunca reutiliza un id por coincidir el
+        nombre), mueve las fotos ya capturadas a una carpeta por ID y entrena
+        la galeria. Devuelve el mensaje a decir; marca la sesión como
+        autenticada solo si todo salió bien.
+        """
+        from app.utils.logger import logger
+
+        self._pending_enroll_temp_folder = None
+        self._pending_enroll_photo_count = 0
+
+        if not temp_folder or not temp_folder.exists():
+            return "No encontré la captura de tu rostro. Vamos a intentarlo de nuevo diciendo que eres usuario nuevo."
+
+        try:
+            user_id = dao.create_user(name)
+            logger.debug(f"Usuario en BD: id={user_id}, nombre={name}")
+
+            final_folder = vision.fotos_dir / f"user_{user_id}"
+            if final_folder.exists():
+                shutil.rmtree(final_folder, ignore_errors=True)
+            shutil.move(str(temp_folder), str(final_folder))
+            write_display_name(final_folder, name)
+
+            photo_files = sorted(final_folder.glob("rostro_*.jpg"))
+            photo_paths = [str(p.relative_to(vision.base_dir)) for p in photo_files]
+            if photo_paths:
+                dao.replace_face_photos(user_id, photo_paths)
+
+            dao.insert_enrollment(user_id, saved, notes=f"Captura automática de {saved} rostros")
+
+            model_path = train_dataset()
+            model_relative = str(Path(model_path).relative_to(vision.base_dir))
+            dao.upsert_global_model(
+                file_path=model_relative,
+                threshold=vision.face_similarity_threshold,
+                version=vision.face_model_name,
+                model_type="ArcFace",
+            )
+
+            event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
+
+            self._user_name = name
+            self._authenticated = True
+            self._conversation_state = None
+            return f"Listo, {name}. Tu cuenta ha sido creada satisfactoriamente. ¿En qué puedo ayudarte?"
+        except Exception as e:
+            logger.error(f"Error al finalizar el registro: {e}", exc_info=True)
+            event_bus.publish("ui:print", role="sys", text=f"[ERROR] {e}")
+            shutil.rmtree(temp_folder, ignore_errors=True)
+            return "Hubo un problema al crear tu cuenta. Intenta registrarte de nuevo."
 
     def _identify_workflow(self) -> None:
         """

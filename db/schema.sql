@@ -3,9 +3,11 @@ PRAGMA foreign_keys = ON;
 -- =========================
 -- Actores / Identidad
 -- =========================
+-- name NO es unique a proposito: dos personas distintas pueden llamarse
+-- igual. La identidad la da el id (y el rostro), nunca el nombre.
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  name          TEXT NOT NULL UNIQUE,      -- "Ricco"
+  name          TEXT NOT NULL,             -- "Ricco"
   alias         TEXT,                      -- opcional
   created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME

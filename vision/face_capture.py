@@ -55,15 +55,24 @@ def _promote_capture(temp_folder: Path, user_folder: Path, count: int) -> None:
 
 
 def capture_faces(
-    name: str,
+    name: Optional[str] = None,
     count: Optional[int] = None,
     show_preview: Optional[bool] = None,
+    folder: Optional[Path] = None,
 ) -> int:
+    """
+    Captura fotos de un rostro. Si se pasa `folder` explicito, se captura ahi
+    directamente (uso: capturar antes de saber el nombre/apodo de la persona).
+    Si no, se resuelve la carpeta a partir de `name` como siempre.
+    """
     from app.utils.logger import logger
 
     count = count if count is not None else vision.capture_count
     show_preview = vision.show_preview if show_preview is None else show_preview
-    folder = ensure_user_folder(name)
+    if folder is None:
+        folder = ensure_user_folder(name or "")
+    else:
+        folder.mkdir(parents=True, exist_ok=True)
     temp_folder = folder / ".capture_tmp"
     logger.debug("Carpeta de captura: %s", folder)
 

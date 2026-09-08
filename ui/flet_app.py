@@ -184,6 +184,15 @@ class OJOZApp:
         
         # Verificar si el mensaje debe ocultarse del chat (solo roles técnicos)
         if role not in ("app/tts", "user"):
+            # Regla genérica: cualquier mensaje de estado con prefijo tipo
+            # "[OK] ...", "[FALLO] ..." o "[ERROR ...] ..." es informativo/
+            # técnico, nunca para el chat (evita tener que listar cada frase
+            # nueva una por una).
+            stripped = (text or "").lstrip()
+            if stripped.startswith(("[OK]", "[FALLO]", "[ERROR")):
+                print(f"[TERMINAL ONLY] {text}")
+                return
+
             norm_text = _norm(text)
             debe_ocultar = any(_norm(filtro) in norm_text for filtro in FILTROS_OCULTAR)
             if debe_ocultar:

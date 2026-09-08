@@ -12,6 +12,16 @@ def get_or_create_user(name: str) -> int:
         cur = conn.execute("INSERT INTO users(name) VALUES (?)", (name,))
         return cur.lastrowid
 
+def create_user(name: str) -> int:
+    """
+    Crea SIEMPRE un usuario nuevo, sin reutilizar el id de otro con el mismo
+    nombre. La identidad la decide el rostro capturado antes de llamar a esto,
+    no el nombre, asi que dos personas distintas pueden llamarse igual.
+    """
+    with get_conn() as conn:
+        cur = conn.execute("INSERT INTO users(name) VALUES (?)", (name,))
+        return cur.lastrowid
+
 def get_user_by_name(name: str) -> Optional[dict]:
     """Retorna los datos del usuario si existe, None si no."""
     with get_conn() as conn:
