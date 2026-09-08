@@ -92,8 +92,13 @@ class STT:
     # -----------------------------
     def start(self) -> None:
         self._running.set()
+        # La calibracion corre en paralelo para no demorar el saludo inicial
+        # (el mic queda deshabilitado hasta tts:end de todas formas, y el
+        # bucle de escucha hace ademas una recalibracion rapida antes de cada
+        # frase). Si aun no termino cuando llegue esa primera frase, esa
+        # recalibracion rapida cubre el hueco.
         if not self._calibrated:
-            self._calibrate_microphone()
+            threading.Thread(target=self._calibrate_microphone, daemon=True).start()
 
         # El modelo de supresión de ruido se carga en paralelo para no demorar
         # el saludo inicial. Si aún no está listo cuando llegue la primera
