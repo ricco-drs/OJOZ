@@ -9,6 +9,7 @@ import cv2
 import base64
 import time
 import unicodedata
+import asyncio
 
 
 class OJOZApp:
@@ -18,11 +19,15 @@ class OJOZApp:
         self.chat_messages = None
         self.camera_preview = None
         self.status_text = None
+        self.status_badge = None
         self.camera_active = False
         self.preview_thread = None
         self.header_container = None
         self.animate_header = True
-        
+        # Empujar para hablar (tecla espacio)
+        self._space_ptt_active = False
+        self._start_push_to_talk_listener()
+
         # Importar event_bus GLOBAL
         from app.core.event_bus import event_bus
         self.event_bus = event_bus
@@ -45,22 +50,58 @@ class OJOZApp:
         self.controller = controller
         self.update_status_badge(self._status_label())
 
+    # -----------------------------
+    # Empujar para hablar (tecla espacio)
+    # -----------------------------
+    def _start_push_to_talk_listener(self) -> None:
+        """
+        Escucha la tecla espacio a nivel de sistema operativo con pynput, en
+        vez de Flet.Page.on_keyboard_event: Flutter (el motor detras de Flet)
+        separa la repeticion de una tecla mantenida en un evento aparte que
+        Flet no reenvia, asi que no hay forma confiable de saber cuando se
+        suelta usando solo eventos de Flet. pynput sí distingue presionar de
+        soltar de verdad, sin depender de repeticiones.
+
+        Nota: al ser un listener global, la tecla espacio activa el
+        microfono aunque la ventana de OJOZ no tenga el foco en ese momento.
+        """
+        try:
+            from pynput import keyboard
+        except ImportError:
+            print("[UI WARNING] pynput no esta instalado; empujar-para-hablar no funcionara. Instala con: pip install pynput")
+            return
+
+        def _on_press(key) -> None:
+            if key != keyboard.Key.space or self._space_ptt_active:
+                return
+            self._space_ptt_active = True
+            if self.controller:
+                self.controller.stt.set_push_to_talk(True)
+
+        def _on_release(key) -> None:
+            if key != keyboard.Key.space or not self._space_ptt_active:
+                return
+            self._space_ptt_active = False
+            if self.controller:
+                self.controller.stt.set_push_to_talk(False)
+
+        listener = keyboard.Listener(on_press=_on_press, on_release=_on_release)
+        listener.daemon = True
+        listener.start()
+
     def _run_on_ui(self, fn) -> None:
-        """
-        Ejecuta `fn` (funcion normal, no corutina) en el contexto de la pagina.
-
-        Los flujos de OJOZ corren en hilos de fondo (bootstrap, TTS, STT, vision)
-        y no pueden tocar los controles directamente: Page.run_thread() reenvia la
-        llamada al executor de la pagina y le adjunta el contexto necesario para
-        que page.update() surta efecto.
-
-        Nota: Page.run_task() NO sirve aqui, exige una corutina y lanza
-        TypeError("handler must be a coroutine function") con funciones normales.
-        """
+        """Serializa los cambios de controles en el bucle de la pagina."""
         if not self.page:
             return
+
+        async def update():
+            try:
+                fn()
+            except Exception as e:
+                print(f"[UI ERROR] No se pudo actualizar la interfaz: {e}")
+
         try:
-            self.page.run_thread(fn)
+            self.page.run_task(update)
         except Exception as e:
             print(f"[UI WARNING] No se pudo programar la actualizacion de UI: {e}")
 
@@ -132,6 +173,7 @@ class OJOZApp:
             "confianza=",
             "esperado=",
             "Verificando identidad...",
+            "Verificando si ya tienes una cuenta...",
             "V Autenticacion exitosa:",
             "Usuario en BD:",
             "Usuario '",
@@ -231,17 +273,16 @@ class OJOZApp:
             def update():
                 self.status_text.value = "Reproduciendo..."
                 self.status_text.color = "#00f5a0"
-                # Animar el contenedor del status con efecto pulsante
-                if hasattr(self.status_text, 'parent'):
-                    self.status_text.parent.border = ft.Border.all(2, "#00f5a080")
-                    self.status_text.parent.bgcolor = "#00f5a020"
-                    self.status_text.parent.shadow = ft.BoxShadow(
+                if self.status_badge:
+                    self.status_badge.border = ft.Border.all(2, "#00f5a080")
+                    self.status_badge.bgcolor = "#00f5a020"
+                    self.status_badge.shadow = ft.BoxShadow(
                         spread_radius=5,
                         blur_radius=25,
                         color="#00f5a060",
                         offset=ft.Offset(0, 5),
                     )
-                    self.status_text.parent.animate = ft.Animation(500, ft.AnimationCurve.EASE_IN_OUT)
+                    self.status_badge.animate = ft.Animation(500, ft.AnimationCurve.EASE_IN_OUT)
                 self.page.update()
             
             self._run_on_ui(update)
@@ -252,11 +293,10 @@ class OJOZApp:
             def update():
                 self.status_text.value = self._status_label()
                 self.status_text.color = "#ffffff"
-                # Restaurar el estilo original con animaci¢n
-                if hasattr(self.status_text, 'parent'):
-                    self.status_text.parent.border = ft.Border.all(1, "#0D1F2330")
-                    self.status_text.parent.bgcolor = "#1a1f3a80"
-                    self.status_text.parent.shadow = ft.BoxShadow(
+                if self.status_badge:
+                    self.status_badge.border = ft.Border.all(1, "#0D1F2330")
+                    self.status_badge.bgcolor = "#1a1f3a80"
+                    self.status_badge.shadow = ft.BoxShadow(
                         spread_radius=0,
                         blur_radius=15,
                         color="#0D1F2320",
@@ -319,22 +359,16 @@ class OJOZApp:
         
         timestamp = datetime.now().strftime("%H:%M")
         
-        # Colores y estilos según el rol
-        if is_user:
-            # Mensajes del usuario: vidrio neutro semitransparente
-            text_color = "#0a0e27"
-            timestamp_color = "#0a0e2780"
-            shadow_color = "#00000030"
-            avatar_label = "Tu"
-        else:
-            # Mensajes del sistema (OJOZ): vidrio neutro con texto claro
-            text_color = "#ffffff"
-            timestamp_color = "#AFB3B7"
-            shadow_color = "#00000035"
-            avatar_label = "OJOZ"
+        # Mismo estilo para ambos roles (uniforme): solo cambian la alineación
+        # (ver mas abajo) y la etiqueta/avatar.
+        text_color = "#ffffff"
+        timestamp_color = "#AFB3B7"
+        shadow_color = "#00000035"
+        avatar_label = "Tu" if is_user else "OJOZ"
         
         # Contenedor del mensaje con glassmorphism y animación
         message_container = ft.Container(
+            col={"xs": 12, "md": 6},
             content=ft.Column([
                 ft.Row([
                     ft.Container(
@@ -343,8 +377,8 @@ class OJOZApp:
                             width=28,
                             height=28,
                             fit=ft.BoxFit.CONTAIN,
-                        ) if not is_user else ft.Text(avatar_label, size=11),
-                        bgcolor="#0D1F2340" if not is_user else "#0a0e2720",
+                        ) if not is_user else ft.Text(avatar_label, size=11, color=text_color),
+                        bgcolor="#0D1F2340",
                         border_radius=20,
                         padding=2,
                         width=32,
@@ -366,6 +400,7 @@ class OJOZApp:
                     weight=ft.FontWeight.W_400,
                     font_family="Poppins",
                     selectable=True,
+                    no_wrap=False,
                 ),
                 ft.Row([
                     ft.Text(
@@ -375,13 +410,12 @@ class OJOZApp:
                         font_family="Poppins",
                     ),
                 ], alignment=ft.MainAxisAlignment.END),
-            ], spacing=10),
+            ], spacing=10, horizontal_alignment=ft.CrossAxisAlignment.STRETCH),
             gradient=None,
-            bgcolor="#0F1822BB",  # tono gris azulado semitransparente tipo glass
+            bgcolor="#0F1822BB",
             border_radius=20,
             padding=22,
-            opacity=0,
-            animate_opacity=ft.Animation(400, ft.AnimationCurve.EASE_IN),
+            opacity=1,
             margin=ft.Margin.only(bottom=10),
             border=None,
             shadow=ft.BoxShadow(
@@ -394,9 +428,11 @@ class OJOZApp:
         )
         
         # Alinear según quién envía
-        row = ft.Row(
+        row = ft.ResponsiveRow(
             [message_container],
             alignment=ft.MainAxisAlignment.START if not is_user else ft.MainAxisAlignment.END,
+            spacing=0,
+            run_spacing=0,
         )
         
         self.chat_messages.controls.append(row)
@@ -404,34 +440,30 @@ class OJOZApp:
         # Actualizar inmediatamente para que el control aparezca en el DOM
         try:
             self.page.update()
-        except:
-            pass
+        except Exception as e:
+            print(f"[UI ERROR] No se pudo mostrar el mensaje: {e}")
         
-        # Animar aparición del mensaje y forzar scroll al final del ListView.
-        # scroll_to() es una corutina en flet 0.86, por eso este handler si va
-        # con run_task() (que exige corutina) en vez de _run_on_ui().
-        async def show_message():
-            message_container.opacity = 1
+        # El desplazamiento es opcional; la burbuja ya debe ser visible.
+        async def scroll_to_message():
+            # Espera a que Flutter mida la nueva burbuja, especialmente si ocupa
+            # varias lineas, antes de calcular el extremo inferior del chat.
+            await asyncio.sleep(0.1)
             try:
                 await self.chat_messages.scroll_to(offset=-1, duration=100)
+                await asyncio.sleep(0.15)
+                await self.chat_messages.scroll_to(offset=-1, duration=0)
             except Exception as e:
                 print(f"[SCROLL ERROR] {e}")
-            try:
-                self.page.update()
-            except Exception:
-                pass
-
         try:
-            self.page.run_task(show_message)
+            self.page.run_task(scroll_to_message)
         except Exception as e:
-            print(f"[UI WARNING] No se pudo animar el mensaje: {e}")
+            print(f"[UI WARNING] No se pudo desplazar el chat: {e}")
     
     def _on_stt_text(self, **kwargs):
-        """Mostrar en el chat lo que el usuario dijo - YA NO SE USA
-        
-        Ahora usamos ui:print con role=user para mostrar el mensaje inmediatamente
-        """
-        pass
+        """Cada transcripcion confirmada se muestra como un mensaje del usuario."""
+        text = (kwargs.get("text") or "").strip()
+        if text:
+            self._on_ui_print(role="user", text=text)
     
     def build(self, page: ft.Page):
         """Construir la interfaz ultra moderna"""
@@ -444,7 +476,7 @@ class OJOZApp:
         page.padding = 0
         page.window.resizable = True
         page.bgcolor = "#9CA0A5"  # Fondo azul oscuro premium
-        
+
         # Configurar ventana maximizada
         page.window.maximized = True
         page.window.always_on_top = False
@@ -509,6 +541,19 @@ class OJOZApp:
             color="#ffffff",
             weight=ft.FontWeight.W_500,
         )
+        self.status_badge = ft.Container(
+            content=self.status_text,
+            bgcolor="#1a1f3a80",
+            border_radius=20,
+            padding=ft.Padding.symmetric(horizontal=20, vertical=10),
+            border=ft.Border.all(1, "#0D1F2330"),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=15,
+                color="#0D1F2320",
+                offset=ft.Offset(0, 5),
+            ),
+        )
         
         status_bar = ft.Container(
             content=ft.Row([
@@ -528,19 +573,7 @@ class OJOZApp:
                     expand=True,
                 ),
                 # Indicador de usuario
-                ft.Container(
-                    content=self.status_text,
-                    bgcolor="#1a1f3a80",
-                    border_radius=20,
-                    padding=ft.Padding.symmetric(horizontal=20, vertical=10),
-                    border=ft.Border.all(1, "#0D1F2330"),
-                    shadow=ft.BoxShadow(
-                        spread_radius=0,
-                        blur_radius=15,
-                        color="#0D1F2320",
-                        offset=ft.Offset(0, 5),
-                    ),
-                ),
+                self.status_badge,
             ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             bgcolor="transparent",
             padding=15,
@@ -702,10 +735,53 @@ class OJOZApp:
             expand=True,
         )
         
-        page.add(main_container)
-        
+        # Indicador flotante del estado del microfono (esquina superior derecha)
+        self.mic_icon = ft.Icon(ft.Icons.MIC_OFF, color="#ff6b6b", size=18)
+        self.mic_label = ft.Text(
+            "Silenciado",
+            size=13,
+            color="#ffffff",
+            weight=ft.FontWeight.W_600,
+            font_family="Poppins",
+        )
+        self.mic_status_badge = ft.Container(
+            content=ft.Row([self.mic_icon, self.mic_label], spacing=8, tight=True),
+            bgcolor="#1a1f3aE0",
+            border_radius=20,
+            padding=ft.Padding.symmetric(horizontal=16, vertical=10),
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=15,
+                color="#00000050",
+                offset=ft.Offset(0, 4),
+            ),
+            top=130,
+            right=20,
+            animate=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
+        )
+        self.event_bus.subscribe("mic:state", self._on_mic_state)
+
+        page.add(ft.Stack([main_container, self.mic_status_badge], expand=True))
+
         # Forzar actualización y maximizar después de agregar contenido
         page.update()
+
+    def _on_mic_state(self, **kwargs) -> None:
+        """Actualiza el indicador flotante segun encienda/apague el microfono."""
+        active = bool(kwargs.get("active"))
+
+        def update():
+            if active:
+                self.mic_icon.name = ft.Icons.MIC
+                self.mic_icon.color = "#00f5a0"
+                self.mic_label.value = "Escuchando..."
+            else:
+                self.mic_icon.name = ft.Icons.MIC_OFF
+                self.mic_icon.color = "#ff6b6b"
+                self.mic_label.value = "Silenciado"
+            self.page.update()
+
+        self._run_on_ui(update)
     
     def _create_compact_option(self, number, title, icon, color):
         """Crear opción compacta horizontal con diseño moderno"""

@@ -7,12 +7,42 @@ import traceback
 import speech_recognition as sr
 
 from app.audio.denoise import TARGET_SAMPLE_RATE, denoiser
+from app.audio.microphone import Microphone, input_devices
 from app.config.settings import stt as stt_config
 from app.core.event_bus import event_bus
 from app.utils.logger import logger
 
 class _SilenceDetected(Exception):
     pass
+
+
+class _ListeningInterrupted(Exception):
+    pass
+
+
+class _PhraseSource(sr.AudioSource):
+    """Deja adaptar SR al ambiente, pero congela el umbral al empezar la voz."""
+
+    def __init__(self, source, recognizer, cancelled=None, on_voice=None):
+        self.source = source
+        self.recognizer = recognizer
+        self.cancelled = cancelled
+        self.on_voice = on_voice
+        self.SAMPLE_RATE = source.SAMPLE_RATE
+        self.SAMPLE_WIDTH = source.SAMPLE_WIDTH
+        self.CHUNK = source.CHUNK
+        self.stream = self
+
+    def read(self, frames):
+        if self.cancelled and self.cancelled():
+            raise _ListeningInterrupted()
+        data = self.source.stream.read(frames)
+        if data and audioop.rms(data, self.SAMPLE_WIDTH) > self.recognizer.energy_threshold:
+            self.recognizer.dynamic_energy_threshold = False
+            if self.on_voice:
+                self.on_voice()
+                self.on_voice = None
+        return data
 
 
 class STT:
@@ -27,11 +57,16 @@ class STT:
 
     def __init__(self):
         self._rec = sr.Recognizer()
+        self._rec.operation_timeout = 10.0
         self._language = getattr(stt_config, "language", None) or "es-ES"
 
         # Seleccion de micro
         self._mic_name = "desconocido"
         self._device_index = stt_config.device_index
+        self._device_name_hint = (getattr(stt_config, "device_name_hint", None) or "").casefold().strip()
+        self._configured_device_index = stt_config.device_index
+        if self._device_index is None:
+            self._device_index = self._auto_select_microphone()
         try:
             names = sr.Microphone.list_microphone_names() or []
             idx = self._device_index
@@ -44,6 +79,8 @@ class STT:
 
         # Parametros de SR
         self._rec.pause_threshold = stt_config.pause_threshold
+        self._rec.phrase_threshold = stt_config.phrase_threshold
+        self._rec.non_speaking_duration = stt_config.non_speaking_duration
         self._rec.dynamic_energy_threshold = stt_config.dynamic_energy_threshold
         if stt_config.energy_threshold is not None:
             self._rec.energy_threshold = stt_config.energy_threshold
@@ -58,6 +95,7 @@ class STT:
         if self._listen_timeout is not None and self._listen_timeout <= 0:
             self._listen_timeout = None
         self._extend_phrase = bool(getattr(stt_config, "extend_phrase", False))
+        self._continuation_timeout = stt_config.continuation_timeout
         self._calibration_duration = max(0.6, getattr(stt_config, "calibration_duration", 1.0) or 1.0)
         self._energy_boost = float(getattr(stt_config, "energy_boost", 1.0) or 1.0)
         self._min_energy_threshold = float(getattr(stt_config, "min_energy_threshold", 0.0) or 0.0)
@@ -71,34 +109,105 @@ class STT:
         self._base_energy_threshold: float | None = None
         self._apply_energy_boost()
 
-        # Recalibración periódica del ruido ambiente.
-        self._recalibrate_cooldown_s = float(getattr(stt_config, "recalibrate_cooldown_s", 20.0) or 0.0)
-        self._recalibrate_every_s = float(getattr(stt_config, "recalibrate_every_s", 180.0) or 0.0)
-        self._last_recalibration = 0.0
-
         self._running = threading.Event()
+        self._capturing = threading.Event()
         self._listen_enabled = threading.Event()
+        # Modo manual (empujar para hablar): el microfono empieza siempre
+        # desactivado y solo la tecla de espacio (via set_push_to_talk) puede
+        # encenderlo. Mientras este activo, cualquier otro intento de
+        # reactivar el microfono desde el resto de la app se ignora, para que
+        # no compita con el control manual.
+        self._manual_mode = bool(getattr(stt_config, "push_to_talk", True))
+        # Grabacion de empujar-para-hablar: mientras se mantiene la tecla se
+        # acumula audio crudo sin ninguna deteccion de silencio; recien al
+        # soltar se limpia el ruido y se transcribe todo de una sola vez.
+        self._ptt_recording = False
+        self._ptt_frames: list[bytes] = []
+        self._ptt_sample_rate = 16000
+        self._ptt_sample_width = 2
         self._calibrated = False
         self._empty_results = 0
-        self._recalibration_lock = threading.Lock()
         self._warned_google = False
         self._last_logged_device_index: int | None = None
         self._has_logged_mic = False
+        self._last_error_message = ""
+        self._recognition_failed = False
+        self._listen_generation = 0
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    # -----------------------------
+    # Seleccion automatica de microfono
+    # -----------------------------
+    @staticmethod
+    def _probe_microphone_rms(index: int) -> float | None:
+        try:
+            with Microphone(device_index=index) as source:
+                # Algunos drivers entregan ceros durante el arranque del stream.
+                for _ in range(max(1, int(0.2 * source.SAMPLE_RATE / source.CHUNK))):
+                    source.stream.read(source.CHUNK)
+                values = []
+                for _ in range(max(1, int(0.5 * source.SAMPLE_RATE / source.CHUNK))):
+                    buf = source.stream.read(source.CHUNK)
+                    if buf:
+                        buf = audioop.bias(buf, source.SAMPLE_WIDTH, -audioop.avg(buf, source.SAMPLE_WIDTH))
+                        values.append(float(audioop.rms(buf, source.SAMPLE_WIDTH)))
+            if not values:
+                return None
+            values.sort()
+            return values[len(values) // 2]
+        except Exception as exc:
+            logger.debug(f"Microfono descartado idx={index}: {exc}")
+            return None
+
+    def _auto_select_microphone(self) -> int | None:
+        """Respeta la entrada de Windows y descarta streams sin senal."""
+        try:
+            candidates = self._available_inputs()
+        except Exception as exc:
+            logger.debug(f"No se pudieron listar microfonos: {exc}")
+            return None
+
+        fallback = None
+        for device in candidates:
+            idx, name = device["index"], device["name"]
+            rms = self._probe_microphone_rms(idx)
+            if rms is None:
+                continue
+            if fallback is None:
+                fallback = idx
+            logger.debug(f"Entrada idx={idx}, nombre='{name}', rms={rms:.1f}")
+            if rms > 0:
+                return idx
+        return fallback
+
+    def _available_inputs(self) -> list[dict]:
+        devices = input_devices()
+        if self._device_name_hint:
+            devices = [d for d in devices if self._device_name_hint in d["name"].casefold()]
+        return devices
+
+    def _microphone_candidates(self) -> list[int]:
+        devices = self._available_inputs()
+        indices = [d["index"] for d in devices]
+        if not indices and self._device_name_hint:
+            raise OSError(f"No hay una entrada conectada con el nombre '{self._device_name_hint}'")
+        if self._strict_device_lock and self._configured_device_index is not None:
+            return [self._configured_device_index]
+        if self._device_index in indices:
+            indices.remove(self._device_index)
+            indices.insert(0, self._device_index)
+        return indices
 
     # -----------------------------
     # Ciclo de vida
     # -----------------------------
     def start(self) -> None:
-        self._running.set()
-        # La calibracion corre en paralelo para no demorar el saludo inicial
-        # (el mic queda deshabilitado hasta tts:end de todas formas, y el
-        # bucle de escucha hace ademas una recalibracion rapida antes de cada
-        # frase). Si aun no termino cuando llegue esa primera frase, esa
-        # recalibracion rapida cubre el hueco.
+        # Controller.start emite el saludo despues de esta llamada: calibrar
+        # aqui evita medir la propia voz de OJOZ o abrir dos streams a la vez.
         if not self._calibrated:
-            threading.Thread(target=self._calibrate_microphone, daemon=True).start()
+            self._calibrate_microphone()
+        self._running.set()
 
         # El modelo de supresión de ruido se carga en paralelo para no demorar
         # el saludo inicial. Si aún no está listo cuando llegue la primera
@@ -107,18 +216,108 @@ class STT:
             threading.Thread(target=denoiser.warmup, daemon=True).start()
 
         if not self._thread.is_alive():
+            if self._thread.ident is not None:
+                self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
 
     def stop(self) -> None:
         self._running.clear()
 
+    def is_capturing(self) -> bool:
+        return self._capturing.is_set()
+
     def enable_listening(self, value: bool) -> None:
+        if value and self._manual_mode:
+            # En modo manual, solo set_push_to_talk (la tecla de espacio)
+            # enciende el microfono, con su propia grabacion; se ignora
+            # cualquier reactivacion automatica del modo de escucha continua
+            # (fin de TTS, workflows, etc.).
+            return
         if value:
             self._listen_enabled.set()
             event_bus.publish("ui:print", role="sys", text="Micrófono activo (escuchando).")
         else:
+            self._listen_generation += 1
             self._listen_enabled.clear()
             event_bus.publish("ui:print", role="sys", text="Micrófono en pausa (TTS hablando).")
+        # Evento dedicado para indicadores visuales (badge de estado del mic),
+        # separado del texto de arriba para no tener que interpretar strings.
+        event_bus.publish("mic:state", active=value)
+
+    def set_push_to_talk(self, active: bool) -> None:
+        """
+        Unico punto de entrada para el microfono en modo manual (mantener
+        presionada la tecla de espacio).
+
+        A diferencia de la escucha automatica (que corta la frase sola por
+        deteccion de silencio, pensada para "siempre escuchando"), aqui se
+        graba audio crudo sin ninguna deteccion mientras se mantiene la
+        tecla; recien al soltarla se limpia el ruido y se transcribe todo lo
+        grabado de una sola vez. Asi la persona decide exactamente cuando
+        empieza y termina su frase, en vez de que lo decida el silencio.
+        """
+        if active:
+            self._start_ptt_recording()
+        else:
+            self._stop_ptt_recording_and_transcribe()
+
+    def _start_ptt_recording(self) -> None:
+        if self._ptt_recording:
+            return
+        self._ptt_recording = True
+        self._ptt_frames = []
+        event_bus.publish("ui:print", role="sys", text="Micrófono activo (escuchando).")
+        event_bus.publish("mic:state", active=True)
+        event_bus.publish("stt:start")
+        threading.Thread(target=self._ptt_record_loop, daemon=True).start()
+
+    def _ptt_record_loop(self) -> None:
+        """Acumula audio crudo del microfono mientras _ptt_recording sea True."""
+        try:
+            candidates = self._microphone_candidates()
+            device_idx = candidates[0] if candidates else self._device_index
+            with Microphone(device_index=device_idx) as source:
+                self._ptt_sample_rate = source.SAMPLE_RATE
+                self._ptt_sample_width = source.SAMPLE_WIDTH
+                while self._ptt_recording:
+                    buf = source.stream.read(source.CHUNK)
+                    if buf:
+                        self._ptt_frames.append(buf)
+        except Exception as exc:
+            logger.debug(f"Error grabando en modo empujar-para-hablar: {exc}")
+            self._report_error("No se pudo grabar del microfono. Revisa el dispositivo de entrada.")
+
+    def _stop_ptt_recording_and_transcribe(self) -> None:
+        if not self._ptt_recording:
+            return
+        self._ptt_recording = False
+        event_bus.publish("mic:state", active=False)
+        event_bus.publish("ui:print", role="sys", text="Micrófono en pausa.")
+
+        # Pequena espera para que el hilo de grabacion termine su ultima
+        # lectura en curso antes de leer/vaciar la lista de fragmentos.
+        time.sleep(0.1)
+        frames, self._ptt_frames = self._ptt_frames, []
+        event_bus.publish("stt:end")
+
+        if not frames:
+            return
+
+        raw = b"".join(frames)
+        try:
+            audio = sr.AudioData(raw, self._ptt_sample_rate, self._ptt_sample_width)
+        except Exception as exc:
+            logger.debug(f"No se pudo armar el audio grabado: {exc}")
+            return
+
+        cleaned = self._denoise(audio)
+        text, conf = self._recognize_with_google(cleaned)
+        if not text and cleaned is not audio and not self._recognition_failed:
+            text, conf = self._recognize_with_google(audio)
+
+        text = (text or "").strip()
+        if text:
+            event_bus.publish("stt:text", text=text, confidence=conf)
 
     # -----------------------------
     # Calibracion y energia
@@ -126,26 +325,17 @@ class STT:
     def _calibrate_microphone(self) -> None:
         try:
             last_err = None
-            candidates = []
-            if self._device_index is not None:
-                candidates.append(self._device_index)
-            candidates.append(None)
-            try:
-                names = sr.Microphone.list_microphone_names() or []
-                for i in range(len(names)):
-                    if i not in candidates:
-                        candidates.append(i)
-            except Exception:
-                pass
+            candidates = self._microphone_candidates()
 
             for device_idx in candidates:
                 try:
-                    with sr.Microphone(device_index=device_idx) as source:
+                    with Microphone(device_index=device_idx) as source:
                         self._rec.adjust_for_ambient_noise(source, duration=self._calibration_duration)
                         measured = self._measure_ambient_rms(source, duration=0.6)
+                    if measured is None or measured == 0:
+                        raise OSError("La entrada devuelve silencio digital; revisa si esta silenciada")
                     self._apply_energy_boost(measured)
                     self._update_noise_floor(measured)
-                    self._last_recalibration = time.monotonic()
                     self._device_index = device_idx
                     try:
                         names = sr.Microphone.list_microphone_names() or []
@@ -164,6 +354,18 @@ class STT:
                     last_err = e
                     logger.debug(f"Microphone calibration failed for index {device_idx}: {e}")
 
+            if self._configured_device_index is not None:
+                event_bus.publish(
+                    "ui:print",
+                    role="sys",
+                    text=(
+                        f"No se pudo calibrar el microfono configurado "
+                        f"(idx={self._configured_device_index}). Prueba otro indice "
+                        "con OJOZ_MIC_INDEX."
+                    ),
+                )
+                return
+
             err_text = str(last_err) if last_err else "error desconocido"
             event_bus.publish("ui:print", role="sys",
                               text=f"No se pudo calibrar el micrófono ({err_text}). Verifica permisos y dispositivo.")
@@ -172,15 +374,6 @@ class STT:
             event_bus.publish("ui:print", role="sys",
                               text=f"No se pudo calibrar el micrófono ({err_text}). Verifica permisos y dispositivo.")
             logger.warning(f"STT calibration failed: {e}")
-
-    def _quick_calibrate(self, source: sr.Microphone) -> None:
-        try:
-            self._rec.adjust_for_ambient_noise(source, duration=0.25)
-            measured = self._measure_ambient_rms(source, duration=0.25)
-            self._apply_energy_boost(measured)
-            self._update_noise_floor(measured)
-        except Exception:
-            pass
 
     def _apply_energy_boost(self, ambient_rms: float | None = None) -> None:
         """
@@ -239,6 +432,7 @@ class STT:
                 buf = source.stream.read(chunk)
                 if not buf:
                     break
+                buf = audioop.bias(buf, width, -audioop.avg(buf, width))
                 values.append(float(audioop.rms(buf, width)))
 
             if not values:
@@ -299,7 +493,12 @@ class STT:
         concurrido se pide una voz cercana al micrófono, que es justo lo que
         distingue al usuario de las conversaciones del entorno.
         """
-        rms = self._compute_rms(audio)
+        # Las pausas de una respuesta corta no deben diluir el nivel de voz.
+        raw = audio.get_raw_data()
+        window = max(1, int(audio.sample_rate * 0.03)) * audio.sample_width
+        levels = sorted(audioop.rms(raw[i:i + window], audio.sample_width)
+                        for i in range(0, len(raw), window))
+        rms = float(levels[min(len(levels) - 1, int(len(levels) * 0.8))]) if levels else 0.0
         floor = self._noise_floor_rms or self._min_rms
         min_allowed = max(self._min_rms, floor * self._snr_min_ratio)
         # Aun con mucho ruido, el listón debe seguir siendo alcanzable por una
@@ -310,37 +509,28 @@ class STT:
             return False
         return True
 
-    def _recalibrate_noise_floor(self, force: bool = False) -> bool:
-        """
-        Vuelve a medir el ruido ambiente sobre el micrófono ya seleccionado.
-
-        Se invoca desde el bucle de escucha con el micrófono cerrado, por lo que
-        abrirlo aquí es seguro. Solo se prueba el dispositivo en uso (no se
-        recorre la lista completa) para que un dispositivo ausente no bloquee la
-        escucha, y cualquier fallo se ignora: es preferible seguir con el umbral
-        anterior antes que interrumpir el reconocimiento.
-        """
-        now = time.monotonic()
-        with self._recalibration_lock:
-            if not force and (now - self._last_recalibration) < self._recalibrate_cooldown_s:
-                return False
-            self._last_recalibration = now
-
-        try:
-            with sr.Microphone(device_index=self._device_index) as source:
-                self._rec.adjust_for_ambient_noise(source, duration=self._calibration_duration)
-                measured = self._measure_ambient_rms(source, duration=0.5)
-            self._apply_energy_boost(measured)
-            self._update_noise_floor(measured)
-            piso = f"{self._noise_floor_rms:.1f}" if self._noise_floor_rms else "sin medir"
-            umbral = getattr(self._rec, "energy_threshold", 0.0) or 0.0
-            logger.debug(
-                f"Ruido ambiente recalibrado: energy_threshold={umbral:.1f}, piso={piso}"
-            )
-            return True
-        except Exception as exc:
-            logger.debug(f"No se pudo recalibrar el ruido ambiente: {exc}")
+    def _refresh_noise_floor(self) -> bool:
+        """Usa el ruido aprendido por SR mientras esperaba voz, sin grabar aparte."""
+        if not self._rec.dynamic_energy_threshold:
             return False
+        measured = self._rec.energy_threshold / self._rec.dynamic_energy_ratio
+        self._noise_floor_rms = measured
+        self._apply_energy_boost(measured)
+        return True
+
+    def _has_clean_voice(self, cleaned: sr.AudioData, original: sr.AudioData) -> bool:
+        """Rescata voz que DTLN separo de un ambiente con mucha energia."""
+        if cleaned is original:
+            return False
+        raw = cleaned.get_raw_data()
+        window = max(1, int(cleaned.sample_rate * 0.03)) * cleaned.sample_width
+        levels = sorted(audioop.rms(raw[i:i + window], cleaned.sample_width)
+                        for i in range(0, len(raw), window))
+        if not levels:
+            return False
+        floor = levels[int(len(levels) * 0.2)]
+        required = max(self._min_rms, floor * self._snr_min_ratio)
+        return sum(level > required for level in levels) * 0.03 >= self._rec.phrase_threshold
 
     # -----------------------------
     def _log_selected_microphone(self, prefix: str = "Microfono", only_if_changed: bool = False) -> None:
@@ -384,26 +574,37 @@ class STT:
         segments: list[sr.AudioData] = []
         total_duration = 0.0
 
-        while True:
-            chunk = self._rec.listen(
-                source,
-                timeout=timeout,
-                phrase_time_limit=chunk_limit,
-            )
-            segments.append(chunk)
-            duration = self._estimate_duration(chunk)
-            total_duration += duration
+        generation = self._listen_generation
+        cancelled = None
+        if self._running.is_set():
+            cancelled = lambda: not self._running.is_set() or generation != self._listen_generation
+        tracked_source = _PhraseSource(source, self._rec, cancelled, self._capturing.set)
+        dynamic = self._rec.dynamic_energy_threshold
+        try:
+            while True:
+                try:
+                    chunk = self._rec.listen(
+                        tracked_source,
+                        timeout=timeout if not segments else self._continuation_timeout,
+                        phrase_time_limit=min(chunk_limit, max_total - total_duration)
+                        if chunk_limit and max_total else chunk_limit,
+                    )
+                except sr.WaitTimeoutError:
+                    if segments:
+                        break
+                    raise
+                if not chunk.frame_data:
+                    break
+                segments.append(chunk)
+                total_duration += self._estimate_duration(chunk)
+                if not extend or (max_total and total_duration >= max_total):
+                    break
+        finally:
+            self._rec.dynamic_energy_threshold = dynamic
+            self._capturing.clear()
 
-            if not extend:
-                break
-
-            near_limit = chunk_limit and duration >= max(chunk_limit - 0.6, chunk_limit * 0.8)
-            if not near_limit:
-                break
-
-            if max_total and total_duration >= max_total:
-                break
-
+        if not segments:
+            raise sr.WaitTimeoutError("No se recibio una frase")
         if len(segments) == 1:
             return segments[0]
         return self._combine_segments(segments)
@@ -436,10 +637,18 @@ class STT:
         modelo y el que prefiere el reconocedor. Ante cualquier problema se
         devuelve el audio recibido sin modificar.
         """
+        if not stt_config.denoise_enabled:
+            return audio
         try:
             raw16 = audio.get_raw_data(convert_rate=TARGET_SAMPLE_RATE, convert_width=2)
             cleaned = denoiser.enhance_pcm16(raw16, TARGET_SAMPLE_RATE)
             if cleaned is None:
+                return audio
+            # No entregar una frase muda o casi borrada por el modelo.
+            original_rms = audioop.rms(raw16, 2)
+            filtered_rms = audioop.rms(cleaned, 2)
+            if filtered_rms < max(1.0, original_rms * 0.05):
+                logger.debug("DTLN atenuo demasiado la frase; se conserva el audio original.")
                 return audio
             return sr.AudioData(cleaned, TARGET_SAMPLE_RATE, 2)
         except Exception as exc:
@@ -450,6 +659,7 @@ class STT:
     # Reconocedores
     # -----------------------------
     def _recognize_with_google(self, audio: sr.AudioData) -> tuple[str, float | None]:
+        self._recognition_failed = False
         try:
             text = self._rec.recognize_google(audio, language=self._language)
             text = (text or "").strip()
@@ -460,11 +670,20 @@ class STT:
             logger.debug("Google STT no entendió el audio.")
             return "", None
         except sr.RequestError as e:
+            self._recognition_failed = True
             logger.debug(f"Google STT request error: {e}")
+            self._report_error("El microfono capta audio, pero no se pudo conectar con el reconocimiento de voz. Revisa tu conexion a internet.")
             return "", None
         except Exception as e:
+            self._recognition_failed = True
             logger.debug(f"Google STT error: {e}")
+            self._report_error(f"No se pudo transcribir el audio: {e}")
             return "", None
+
+    def _report_error(self, message: str) -> None:
+        if message != self._last_error_message:
+            event_bus.publish("ui:print", role="sys", text=message)
+            self._last_error_message = message
 
     # -----------------------------
     # Normalización de texto
@@ -490,24 +709,15 @@ class STT:
     # Bucle principal
     # -----------------------------
     def _loop(self):
-        while True:
-            if not self._running.is_set():
-                time.sleep(0.05)
-                continue
+        while self._running.is_set():
             if not self._listen_enabled.is_set():
                 time.sleep(0.02)
                 continue
 
-            # Recalibración periódica: el ruido de un stand cambia durante la
-            # jornada y un piso medido al arrancar deja de ser representativo.
-            if (
-                self._recalibrate_every_s > 0
-                and (time.monotonic() - self._last_recalibration) >= self._recalibrate_every_s
-            ):
-                self._recalibrate_noise_floor(force=True)
-
+            generation = self._listen_generation
             event_bus.publish("stt:start")
             text, conf = "", None
+            self._recognition_failed = False
 
             try:
                 if not self._warned_google:
@@ -519,28 +729,14 @@ class STT:
                     self._warned_google = True
 
                 last_err = None
-                candidates = []
-                if self._device_index is not None:
-                    candidates.append(self._device_index)
-                else:
-                    candidates.append(None)
-                # Si strict_device_lock es False, probamos otros mics si falla el principal.
-                if not self._strict_device_lock:
-                    try:
-                        names = sr.Microphone.list_microphone_names() or []
-                        for i in range(len(names)):
-                            if i not in candidates:
-                                candidates.append(i)
-                    except Exception:
-                        pass
+                candidates = self._microphone_candidates()
 
                 audio = None
                 timeout_silence = False
                 for device_idx in candidates:
                     try:
                         logger.debug(f"Trying microphone for listen: device_index={device_idx}")
-                        with sr.Microphone(device_index=device_idx) as source:
-                            self._quick_calibrate(source)
+                        with Microphone(device_index=device_idx) as source:
                             audio = self._record_phrase(source)
                         self._device_index = device_idx
                         self._log_selected_microphone(prefix="Microfono en uso", only_if_changed=True)
@@ -551,6 +747,7 @@ class STT:
                         logger.debug(f"No se detectó voz en el tiempo esperado (idx={device_idx}).")
                         self._device_index = device_idx
                         audio = None
+                        self._refresh_noise_floor()
                         break
                     except Exception as e:
                         last_err = e
@@ -561,39 +758,51 @@ class STT:
                         raise _SilenceDetected("timeout")
                     raise RuntimeError(f"Unable to open any microphone: {last_err}")
 
-                # Filtro anti-ruido / anti-voz-lejana. Se evalúa sobre el audio
-                # original, que es con el que se midió el piso de ruido.
-                if not self._passes_voice_gate(audio):
+                if not self._running.is_set() or generation != self._listen_generation or not self._listen_enabled.is_set():
+                    continue
+
+                cleaned = self._denoise(audio)
+                if not self._passes_voice_gate(audio) and not self._has_clean_voice(cleaned, audio):
                     raise _SilenceDetected("noise_gate")
 
                 # Solo se limpia lo que ya se considera voz: ahorra CPU y evita
                 # procesar ruido que igualmente se iba a descartar.
-                audio = self._denoise(audio)
+                logger.debug(f"Voz capturada: {self._estimate_duration(audio):.1f}s, rms={self._compute_rms(audio):.1f}")
+                text, conf = self._recognize_with_google(cleaned)
+                if not text and cleaned is not audio and not self._recognition_failed:
+                    text, conf = self._recognize_with_google(audio)
 
-                text, conf = self._recognize_with_google(audio)
-
+            except _ListeningInterrupted:
+                continue
             except _SilenceDetected:
                 logger.debug("Silencio detectado: reintentando escucha.")
                 self._empty_results += 1
                 if self._empty_results >= self._recalibrate_after_empty:
                     self._empty_results = 0
-                    self._recalibrate_noise_floor()
+                    self._report_error("No se detecta tu voz. Comprueba que el microfono este activado y habla cerca de el.")
                 time.sleep(0.2)
                 continue
             except Exception:
                 logger.debug("STT listen error:\n" + traceback.format_exc())
+                self._report_error("No se pudo leer el microfono. Revisa el dispositivo de entrada y los permisos de microfono de Windows.")
+                time.sleep(1.0)
+                continue
             finally:
                 event_bus.publish("stt:end")
 
             text = (text or "").strip()
             if text:
+                # El audio ya se valido antes de transcribirlo. Que OJOZ empiece
+                # a hablar durante la peticion de red no borra esa frase previa.
+                if not self._running.is_set():
+                    continue
+                self._last_error_message = ""
                 self._empty_results = 0
-                event_bus.publish("ui:print", role="user", text=text)
                 event_bus.publish("stt:text", text=text, confidence=conf)
-            else:
+            elif not self._recognition_failed:
                 self._empty_results += 1
                 if self._empty_results >= self._recalibrate_after_empty:
                     self._empty_results = 0
-                    self._recalibrate_noise_floor()
+                    self._report_error("Se recibe audio, pero no se entienden las palabras. Acerca el microfono y vuelve a hablar.")
 
             time.sleep(0.05)

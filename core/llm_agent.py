@@ -51,9 +51,13 @@ exactas: "tengo un billete, ¿cuánto vale?" es dinero; "tengo un documento, \
 describir escena.
 
 Cómo trabajar:
-- Antes de usar la cámara, avisa en la misma respuesta qué debe hacer la persona \
+- Antes de usar la cámara para leer_documento, identificar_dinero o \
+verificar_vencimiento, avisa en la misma respuesta qué debe hacer la persona \
 (por ejemplo, dónde poner el documento). Ese aviso se escucha antes de que la \
 cámara empiece a capturar.
+- identificar_usuario y registrar_usuario ya avisan ellas mismas por su \
+cuenta antes de encender la cámara; no repitas ese aviso ni digas nada como \
+"voy a mirar la cámara" antes de llamarlas.
 - Para usar cualquiera de las funciones, la persona debe estar identificada. \
 Si no sabes quién es, usa identificar_usuario primero (mira a la cámara) en \
 vez de preguntar el nombre: puede que ya tenga cuenta y así no hace falta \
@@ -322,6 +326,17 @@ class LLMAgent:
         with self._lock:
             self._history = []
 
+    def start_conversation(self, introduction: str) -> str | None:
+        """Continua tras el saludo sin necesitar un primer mensaje del usuario."""
+        return self.handle(
+            "Evento interno de inicio de la aplicacion, no es un mensaje del usuario. "
+            f"OJOZ acaba de terminar de decir: {introduction}\n"
+            "Continua la conversacion sin repetir el saludo ni la presentacion. "
+            "Si la identidad ya esta verificada, pregunta brevemente en que puedes ayudar. "
+            "Si no lo esta, avisa que mire a la camara y usa identificar_usuario. "
+            "Espera la respuesta de la persona antes de registrar una cuenta o ejecutar otra funcion."
+        )
+
     def handle(self, user_text: str) -> str | None:
         """
         Procesa lo que dijo la persona y devuelve la respuesta final a enunciar.
@@ -369,6 +384,7 @@ class LLMAgent:
             llamadas = [b for b in response.content if b.type == "tool_use"]
 
             if not llamadas:
+                history.append({"role": "assistant", "content": response.content})
                 return "\n".join(t.strip() for t in textos if t.strip()) or None
 
             # Lo que dice antes de actuar se enuncia ya, para que la persona sepa

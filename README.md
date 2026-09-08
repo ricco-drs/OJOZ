@@ -204,10 +204,10 @@ app/
 
 ## Conversación: dos modos
 
-El asistente puede conducir el diálogo de dos maneras. La primera es la que se
-usa por defecto; la segunda se activa explícitamente.
+El asistente puede conducir el diálogo de dos maneras. Usa el modelo cuando
+hay una credencial configurada y el enrutador como respaldo.
 
-**A. Enrutador por palabras clave** (`core/router.py`, activo por defecto)
+**A. Enrutador por palabras clave** (`core/router.py`, modo de respaldo)
 
 Reconoce la intención buscando expresiones conocidas: *"primera opción"*,
 *"cuánto vale"*, *"fecha de vencimiento"*. Es inmediato, no cuesta nada y
@@ -241,9 +241,13 @@ vuelve solo al modo A y sigue atendiendo con normalidad.
 
 | Variable | Efecto |
 |---|---|
-| `OJOZ_LLM` | Activa (`1`) el modo conversacional |
+| `OJOZ_LLM` | Habilitado por defecto; `0` desactiva el modo conversacional |
 | `OJOZ_LLM_MODEL` | Modelo a usar (por defecto `claude-sonnet-5`) |
 | `ANTHROPIC_API_KEY` | Credencial de la API |
+
+Al terminar el saludo, el modelo inicia la conversacion sin esperar un mensaje
+del usuario. Si falta la credencial o falla el servicio, se reactiva la escucha
+con el flujo por palabras clave.
 
 El reconocimiento facial se puede ajustar sin modificar código:
 
@@ -261,7 +265,7 @@ medición.
 
 ```
 umbral de escucha = ruido medido x 1.5
-se acepta la voz  = supera el ruido medido x 3.5
+se acepta la voz  = nivel de los segmentos hablados supera el ruido medido x 1.5
 ```
 
 Como el criterio es relativo, el mismo ajuste sirve en cualquier sitio: en una
@@ -271,9 +275,11 @@ justo lo que separa al usuario de las conversaciones del entorno. Ambos límites
 están acotados por arriba y por abajo, de manera que ni el ruido electrónico
 dispara la escucha ni un golpe puntual deja al asistente sordo.
 
-La medición se repite cada dos minutos mientras la aplicación está en uso, así
-que el asistente sigue el ambiente según cambia a lo largo del día sin que nadie
-tenga que intervenir.
+La calibración inicial termina antes del saludo. Durante la escucha, el umbral
+se adapta mientras espera voz; no se consumen los primeros sonidos de cada
+respuesta para volver a calibrar. La selección prioriza la entrada de Windows
+que entregue señal, y descarta salidas y entradas que devuelven ceros. Si se
+elige por `OJOZ_MIC_NAME`, los dispositivos alternativos respetan ese nombre.
 
 Para comprobarlo en un lugar concreto, `python -m app.tools.check_audio` mide el
 ruido real, indica si la voz superaría el umbral y deja dos grabaciones
@@ -288,6 +294,8 @@ ejemplo—, estas variables permiten afinar sin editar código:
 | `OJOZ_SNR_RATIO` | Cuánto debe superar la voz al ruido de fondo |
 | `OJOZ_MIN_RMS` | Nivel mínimo absoluto para aceptar audio |
 | `OJOZ_DENOISE` | Activa (`1`) o desactiva (`0`) la supresión de ruido |
+| `OJOZ_MIC_INDEX` | Fija el índice del micrófono si el predeterminado de Windows no funciona |
+| `OJOZ_MIC_NAME` | Fija el micrófono por parte del nombre, por ejemplo `Realtek` o `WH-1000XM6` |
 
 Para una voz mas natural, OJOZ usa ElevenLabs como primer motor cuando existen
 `ELEVENLABS_API_KEY` y `ELEVENLABS_VOICE_ID`. Si la API no responde, conserva el

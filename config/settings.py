@@ -56,6 +56,7 @@ class STTConfig:
     # Selección de micrófono: usa None para el predeterminado, o un índice (int).
     # Para ver los índices disponibles, imprime sr.Microphone.list_microphone_names()
     device_index: Optional[int] = None
+    device_name_hint: Optional[str] = None
 
     # Idioma (para Google STT). Ejemplo: español de Perú.
     language: str = "es-PE"
@@ -68,6 +69,10 @@ class STTConfig:
     # en frases tipo "me llamo rico" o "soy rico", se escribirá "ricco".
     normalize_ricco: bool = True
 
+    # Empujar para hablar: el microfono empieza siempre desactivado y solo se
+    # enciende mientras se mantiene presionada la tecla de espacio.
+    push_to_talk: bool = True
+
     # Parámetros de escucha.
     # Tiempo máximo de frase y tolerancia a pausas amplios para que el usuario pueda
     # decir "Hola OJOZ, es mi primera vez aquí" sin que se corte tras "Hola OJOZ".
@@ -75,7 +80,10 @@ class STTConfig:
     max_phrase_seconds: Optional[float] = 30.0  # extiende automáticamente en frases largas
     listen_timeout: Optional[float] = 4.5       # espera de inicio de habla antes de reintentar
     extend_phrase: bool = True                  # activar concatenación de fragmentos largos
-    pause_threshold: float = 0.9                # espera antes de cortar por silencio
+    pause_threshold: float = 1.2                # tolera pausas dentro de una frase
+    continuation_timeout: float = 0.7           # une la continuacion antes de transcribir
+    phrase_threshold: float = 0.15              # admite respuestas breves como "si"
+    non_speaking_duration: float = 0.5           # conserva el inicio y final de las palabras
     calibration_duration: float = 2.0           # segundos para medir ruido ambiente
 
     # Los umbrales no son valores fijos: se recalculan a partir del ruido que se
@@ -88,21 +96,16 @@ class STTConfig:
     min_energy_threshold: float = 50.0          # suelo: evita disparar con ruido electrónico
     max_energy_threshold: float = 4000.0        # techo: evita quedar sordo ante un ruido puntual
     recalibrate_after_empty: int = 3            # frases vacías antes de recalibrar
-    dynamic_energy_threshold: bool = False      # la adaptación la gestiona la recalibración propia
+    dynamic_energy_threshold: bool = True       # adapta el umbral mientras espera voz
     energy_threshold: Optional[int] = None      # usa valor fijo si lo seteas
 
     # Filtro / robustez frente a ruido. Al comparar la voz contra el ruido
     # medido, el mismo valor sirve en silencio y en ambiente ruidoso: lo que
     # cambia es la referencia, no el criterio.
     strict_device_lock: bool = False  # permite probar otros micrófonos si falla el configurado
-    snr_min_ratio: float = 3.5        # cuánto debe superar la voz al ruido de fondo
+    snr_min_ratio: float = 1.5        # margen para admitir respuestas cortas y voz suave
     min_rms: float = 40.0             # RMS absoluto mínimo
     max_required_rms: float = 3500.0  # tope: por muy alto que sea el ruido, sigue siendo alcanzable
-
-    # Recalibración periódica del piso de ruido: el ruido de un lugar cambia a
-    # lo largo del día, así que la referencia se vuelve a medir sola.
-    recalibrate_cooldown_s: float = 20.0  # espera mínima entre recalibraciones
-    recalibrate_every_s: float = 120.0    # recalibra igual cada N s aunque haya voz
 
     # Supresión de ruido por modelo de IA (DTLN sobre ONNX Runtime).
     # El audio capturado se limpia antes de enviarlo a reconocer. Si el modelo
@@ -110,7 +113,7 @@ class STTConfig:
     # Los pesos viven en assets/models/dtln/ y se versionan con el proyecto.
     denoise_enabled: bool = True
     denoise_min_seconds: float = 0.3   # audios más cortos no se procesan
-    denoise_max_seconds: float = 20.0  # evita procesar audios muy largos en CPU
+    denoise_max_seconds: float = 32.0  # cubre tambien las frases extendidas
 
 
 @dataclass
@@ -118,14 +121,13 @@ class LLMConfig:
     """
     Conversación gestionada por un modelo de lenguaje (opción B).
 
-    Desactivada por defecto: el asistente funciona con el enrutador por palabras
-    clave de siempre. Al activarla, el modelo conduce el diálogo y el enrutador
-    queda como respaldo automático si falla la conexión o la API.
+    Se inicia al terminar el saludo si hay una credencial configurada. El
+    enrutador queda como respaldo si falta la credencial o falla la API.
 
     Requiere una credencial en la variable de entorno ANTHROPIC_API_KEY.
     """
 
-    enabled: bool = False
+    enabled: bool = True
     model: str = "claude-sonnet-5"
     max_tokens: int = 1024          # las respuestas son habladas, no hacen falta más
     effort: str = "low"             # prioriza la fluidez de la conversación
@@ -167,8 +169,16 @@ def _apply_env_overrides() -> None:
     stt.snr_min_ratio = _env_float("OJOZ_SNR_RATIO", stt.snr_min_ratio)
     stt.min_rms = _env_float("OJOZ_MIN_RMS", stt.min_rms)
     stt.denoise_enabled = _env_bool("OJOZ_DENOISE", stt.denoise_enabled)
+    stt.push_to_talk = _env_bool("OJOZ_PUSH_TO_TALK", stt.push_to_talk)
+    mic_index = os.environ.get("OJOZ_MIC_INDEX", "").strip()
+    if mic_index:
+        try:
+            stt.device_index = int(mic_index)
+        except ValueError:
+            stt.device_index = None
+    stt.device_name_hint = os.environ.get("OJOZ_MIC_NAME", "").strip() or stt.device_name_hint
 
-    # Conversación por modelo de lenguaje: se activa explícitamente.
+    # OJOZ_LLM=0 permite desactivar la conversacion por modelo.
     llm.enabled = _env_bool("OJOZ_LLM", llm.enabled)
     llm.model = os.environ.get("OJOZ_LLM_MODEL", llm.model).strip() or llm.model
 
@@ -281,5 +291,5 @@ vision = VisionConfig(
     face_model_name=os.environ.get("OJOZ_FACE_MODEL", "buffalo_l"),
     face_provider=os.environ.get("OJOZ_FACE_PROVIDER", "auto"),
     face_similarity_threshold=_env_float("OJOZ_FACE_THRESHOLD", 0.50),
-    show_preview=True,
+    show_preview=_env_bool("OJOZ_SHOW_PREVIEW", True),
 )

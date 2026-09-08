@@ -5,6 +5,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Literal
 
@@ -88,6 +89,11 @@ class Controller:
             estado=self._llm_estado,
         )
         self._llm_reset_pending = False
+        self._pending_llm_after_intro = False
+        self._llm_turn_active = False
+        self._user_turn_active = False
+        self._pending_user_texts = deque()
+        self._introduction = ""
 
         self._register_events()
 
@@ -130,6 +136,10 @@ class Controller:
                 return 10.0
 
         def identificar_usuario() -> str:
+            self.tts.join()
+            # Aviso obligatorio antes de encender la cámara: no depende de
+            # que el modelo decida avisarlo por su cuenta.
+            self.speak("Posiciónate bien frente a la cámara para poder reconocerte.")
             self.tts.join()
             try:
                 ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
@@ -505,7 +515,14 @@ class Controller:
         return re.sub(r"\d+", _repl, text)
 
     def start(self) -> None:
-        """Arranca el reconocimiento y da un saludo inicial por TTS."""
+        """
+        Arranca el reconocimiento y da un saludo inicial por TTS.
+
+        Solo este primer saludo es automático: no se dispara
+        _start_llm_after_intro aquí, para que OJOZ se quede esperando la
+        respuesta real de la persona (si es nueva o ya tiene cuenta) en vez
+        de continuar la conversación por su cuenta.
+        """
         self.stt.start()
 
         dev_login = os.environ.get("OJOZ_DEV_LOGIN", "").strip()
@@ -516,13 +533,54 @@ class Controller:
             # No usar en la demo real: no verifica identidad.
             self._user_name = dev_login
             self._authenticated = True
-            self.speak(f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?")
+            self._introduction = f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?"
+            self.speak(self._introduction)
             return
 
-        self.speak("Hola, soy OJOZ, tu asistente. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?")
+        self._introduction = "Hola, soy OJOZ, tu asistente. ¿Es tu primera vez aquí o ya tienes una cuenta registrada?"
+        self.speak(self._introduction)
+
+    def _start_llm_after_intro(self) -> bool:
+        with self._lock:
+            if self._llm_turn_active:
+                return True
+            if not self._pending_llm_after_intro or self._watch_stop.is_set():
+                return False
+            self._pending_llm_after_intro = False
+            self._llm_turn_active = True
+        self._cancel_fallback_rearm()
+        self.stt.enable_listening(True)
+        self._set_state("PROCESSING")
+
+        def _continue_conversation():
+            response = None
+            try:
+                if not self._watch_stop.is_set() and self._llm.is_available():
+                    response = self._llm.start_conversation(self._introduction)
+            except Exception:
+                from app.utils.logger import logger
+                logger.exception("No se pudo iniciar la conversacion tras el saludo")
+            finally:
+                with self._lock:
+                    self._llm_turn_active = False
+            if self._watch_stop.is_set():
+                return
+            if response:
+                self.speak(response)
+            else:
+                self._enable_listening_after_delay()
+
+        # Las acciones del LLM esperan tts.join(): nunca ejecutarlas en el hilo TTS.
+        threading.Thread(target=_continue_conversation, daemon=True).start()
+        return True
 
     def speak(self, text: str) -> None:
         """Envía texto a TTS (el gate de STT lo gestiona tts:start/tts:end o el watchdog)."""
+        # No cortar una respuesta que empezo mientras el modelo pensaba.
+        while self.stt.is_capturing() and not self._watch_stop.is_set():
+            time.sleep(0.02)
+        if self._watch_stop.is_set():
+            return
         # Publicar PRIMERO al chat (antes de que el TTS empiece a hablar)
         event_bus.publish("ui:print", role="app/tts", text=text)
         # Luego enviar al TTS para que hable
@@ -544,6 +602,12 @@ class Controller:
         - Si hay una acción pendiente (enrolamiento o autenticación), ejecútala ahora.
         - Si no, rearmar STT después de un pequeño delay.
         """
+        if self._start_llm_after_intro():
+            # Entre las indicaciones habladas, permite responder aunque la
+            # identificacion o el LLM sigan trabajando. El turno queda en cola.
+            self._enable_listening_after_delay()
+            return
+
         # === Disparadores atados al fin del mensaje del TTS ===
         # Enrolamiento: "Bienvenido {name}, mire a la camara..."
         if self._pending_enroll_after_tts and self._user_name:
@@ -599,6 +663,29 @@ class Controller:
         self._enable_listening_after_delay()
 
     def _on_stt_text(self, text: str, confidence=None) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self._pending_user_texts.append(text)
+        self._dispatch_user_turn()
+
+    def _dispatch_user_turn(self) -> bool:
+        with self._lock:
+            if (self._watch_stop.is_set() or self._llm_turn_active or self._user_turn_active
+                    or self._pending_llm_after_intro or self.tts.is_speaking()
+                    or not self._pending_user_texts):
+                return False
+            text = self._pending_user_texts.popleft()
+            self._user_turn_active = True
+        try:
+            self._process_stt_text(text)
+        finally:
+            with self._lock:
+                self._user_turn_active = False
+        return True
+
+    def _process_stt_text(self, text: str) -> None:
         # Bloquea escucha mientras procesa la intención
         self.stt.enable_listening(False)
         self._set_state("PROCESSING")
@@ -606,7 +693,13 @@ class Controller:
         # Opción B: si la conversación por modelo está activa, atiende ella el
         # turno. Si no está disponible o falla, se sigue con el flujo de siempre.
         if self._llm.is_available():
-            respuesta = self._llm.handle(text)
+            with self._lock:
+                self._llm_turn_active = True
+            try:
+                respuesta = self._llm.handle(text)
+            finally:
+                with self._lock:
+                    self._llm_turn_active = False
             if self._llm_reset_pending:
                 self._llm.reset()
                 self._llm_reset_pending = False
@@ -638,7 +731,7 @@ class Controller:
             self._user_name = self._extract_name(text)
             self._conversation_state = None
             self._pending_enroll_after_tts = True
-            reply = f"{self._user_name}, mire a la cámara. Vamos a crearte una cuenta."
+            reply = f"Encantado, {self._user_name}."
 
         elif self._conversation_state == "waiting_new_user_name":
             lower = (text or "").lower()
@@ -656,11 +749,11 @@ class Controller:
                 if dao.user_exists(self._user_name):
                     # Usuario ya existe, redirigir a autenticación
                     self._pending_auth_after_tts = True
-                    reply = "Tu ya tienes una cuenta creada, por favor mire a la camara para verificar identidad."
+                    reply = "Tu ya tienes una cuenta creada."
                 else:
                     # Usuario nuevo, proceder con captura y entrenamiento
                     self._pending_enroll_after_tts = True
-                    reply = f" {self._user_name}, mire a la cámara. Vamos a crearte una cuenta."
+                    reply = f"Encantado, {self._user_name}."
         
         elif self._conversation_state == "waiting_returning_user_name":
             lower = (text or "").lower()
@@ -678,7 +771,7 @@ class Controller:
                     # Usuario encontrado, proceder con autenticación facial
                     self._conversation_state = None  # Salir del flujo
                     self._pending_auth_after_tts = True
-                    reply = f"¡ Un gusto tenerte de vuelta {self._user_name}!, mire a la cámara para verificar identidad por favor."
+                    reply = f"¡Un gusto tenerte de vuelta, {self._user_name}!"
                 else:
                     # Usuario no encontrado: preguntar si desea registrarse
                     self._conversation_state = "confirm_register_for_returning"
@@ -912,7 +1005,7 @@ class Controller:
             # pregunta despues, ya con las fotos listas (evita atar el
             # registro a un nombre que otra persona ya podria usar).
             self._pending_enroll_capture_after_tts = True
-            return "Entendido, mírame a la cámara para capturar tu rostro."
+            return "Entendido."
 
         if intent == "returning_user_option":
             # Si ya está autenticado, interpretar como Opción 2 del menú
@@ -922,7 +1015,7 @@ class Controller:
             # Ya tiene cuenta: se reconoce por rostro, sin pedir el nombre
             # (asi el nombre nunca decide la identidad).
             self._pending_identify_after_tts = True
-            return "Que bueno tenerte de vuelta, mírame a la cámara para reconocerte."
+            return "Que bueno tenerte de vuelta."
 
         if intent == "open_camera":
             # Mantengo tu intent original; ahora la cámara se usa en workflows.
@@ -974,6 +1067,16 @@ class Controller:
 
         def _reactivate():
             time.sleep(delay)
+            if self._watch_stop.is_set() or self.tts.is_speaking():
+                return
+            with self._lock:
+                if self._llm_turn_active:
+                    self.stt.enable_listening(True)
+                    return
+            if self._start_llm_after_intro():
+                return
+            if self._dispatch_user_turn():
+                return
             # Solo reactivar si no estamos ya escuchando
             with self._lock:
                 if self.state == "LISTENING":
@@ -1010,12 +1113,20 @@ class Controller:
         with self._lock:
             self._fallback_timer = None
             current_state = self.state
+            if self._llm_turn_active or self._watch_stop.is_set():
+                return
 
         if self.tts.is_speaking():
             # El TTS sigue hablando de verdad (frase larga): no forzar el
             # microfono a mitad de la frase, o captaria la propia voz de OJOZ
             # por el parlante. Se reintenta pasado el mismo plazo de seguridad.
             self._schedule_fallback_rearm()
+            return
+
+        if self._start_llm_after_intro():
+            return
+
+        if self._dispatch_user_turn():
             return
 
         # Solo reactivar si no estamos ya escuchando
@@ -1062,6 +1173,10 @@ class Controller:
         try:
             # Bloquear escucha durante enrolamiento
             self.stt.enable_listening(False)
+            # Aviso obligatorio antes de encender la cámara: nunca se hace
+            # reconocimiento facial sin decirlo primero.
+            self.speak(f"Perfecto, {name}. Mantente frente a la cámara mientras te capturo.")
+            self.tts.join()
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros para {name}...")
 
@@ -1125,6 +1240,10 @@ class Controller:
 
         try:
             self.stt.enable_listening(False)
+            # Aviso obligatorio antes de encender la cámara: nunca se hace
+            # reconocimiento facial sin decirlo primero.
+            self.speak("Posiciónate bien frente a la cámara para poder reconocerte.")
+            self.tts.join()
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text="Verificando si ya tienes una cuenta...")
 
@@ -1141,6 +1260,8 @@ class Controller:
                 self.speak(f"Ya tienes una cuenta, {nombre_existente}. ¿En qué puedo ayudarte?")
                 return
 
+            self.speak("Perfecto, vamos a crear tu cuenta. Mantente frente a la cámara mientras te capturo.")
+            self.tts.join()
             event_bus.publish("ui:print", role="sys", text=f"Iniciando captura de {vision.capture_count} rostros...")
 
             temp_folder = vision.fotos_dir / f"_pendiente_{uuid.uuid4().hex[:10]}"
@@ -1234,6 +1355,10 @@ class Controller:
 
         try:
             self.stt.enable_listening(False)
+            # Aviso obligatorio antes de encender la cámara: nunca se hace
+            # reconocimiento facial sin decirlo primero.
+            self.speak("Posiciónate bien frente a la cámara para poder reconocerte.")
+            self.tts.join()
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
 
@@ -1273,6 +1398,10 @@ class Controller:
         try:
             # Bloquear escucha durante autenticación
             self.stt.enable_listening(False)
+            # Aviso obligatorio antes de encender la cámara: nunca se hace
+            # reconocimiento facial sin decirlo primero.
+            self.speak("Posiciónate bien frente a la cámara para poder reconocerte.")
+            self.tts.join()
             event_bus.publish("camera.opened", index=vision.camera_index)
             event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
 

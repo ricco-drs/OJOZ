@@ -33,6 +33,10 @@ def _on_stt_start():
 def _on_stt_end():
     print(Style.DIM + f"{_stamp()} [STT] fin de escucha" + Style.RESET_ALL, flush=True)
 
+
+def _on_stt_text(text: str, confidence=None):
+    _on_ui_print(role="user", text=text)
+
 def init_console_view():
     # Suscripciones a eventos del bus
     event_bus.subscribe("ui:print", _on_ui_print)
@@ -41,3 +45,4 @@ def init_console_view():
     event_bus.subscribe("tts:end",   lambda: _on_tts_end())
     event_bus.subscribe("stt:start", lambda: _on_stt_start())
     event_bus.subscribe("stt:end",   lambda: _on_stt_end())
+    event_bus.subscribe("stt:text", _on_stt_text)

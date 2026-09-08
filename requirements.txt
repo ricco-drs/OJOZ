@@ -39,3 +39,9 @@ anthropic==1.0.0
 
 # --- Utilidades ---
 colorama==0.4.6
+
+# --- Empujar para hablar (tecla espacio) ---
+# Flet no reenvia la repeticion de una tecla mantenida (Flutter la separa en
+# un evento aparte que Flet no expone), asi que la deteccion de "soltar" se
+# hace a nivel de sistema operativo con esta libreria.
+pynput==1.8.2

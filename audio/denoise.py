@@ -146,8 +146,12 @@ class _Denoiser:
         name1_audio, name1_state = self._io1
         name2_audio, name2_state = self._io2
 
-        # Relleno final para que las últimas muestras también se procesen.
-        padded = np.concatenate([samples, np.zeros(_BLOCK_LEN, dtype=np.float32)])
+        # El solapamiento retrasa la salida 384 muestras. Se drena el estado
+        # al final y se compensa ese retardo para no perder las ultimas silabas.
+        delay = _BLOCK_LEN - _BLOCK_SHIFT
+        total = len(samples) + delay
+        padding = delay + (-total % _BLOCK_SHIFT)
+        padded = np.concatenate([samples, np.zeros(padding, dtype=np.float32)])
         output = np.zeros(len(padded), dtype=np.float32)
 
         in_buffer = np.zeros(_BLOCK_LEN, dtype=np.float32)
@@ -155,7 +159,7 @@ class _Denoiser:
         state1 = np.zeros(_STATE_SHAPE, dtype=np.float32)
         state2 = np.zeros(_STATE_SHAPE, dtype=np.float32)
 
-        num_blocks = (len(padded) - (_BLOCK_LEN - _BLOCK_SHIFT)) // _BLOCK_SHIFT
+        num_blocks = len(padded) // _BLOCK_SHIFT
 
         for idx in range(num_blocks):
             start = idx * _BLOCK_SHIFT
@@ -185,7 +189,7 @@ class _Denoiser:
 
             output[start : start + _BLOCK_SHIFT] = out_buffer[:_BLOCK_SHIFT]
 
-        return output[: len(samples)]
+        return output[delay:delay + len(samples)]
 
     def enhance_pcm16(self, raw: bytes, sample_rate: int = TARGET_SAMPLE_RATE) -> bytes | None:
         """
