@@ -344,30 +344,33 @@ class OJOZApp:
                     ),
                     ft.Text(
                         "OJOZ" if not is_user else "Tú",
-                        size=12,
+                        size=13,
                         color=timestamp_color,
                         weight=ft.FontWeight.BOLD,
+                        font_family="Poppins",
                     ),
                 ], spacing=8),
                 ft.Text(
                     text,
                     color=text_color,
-                    size=15,
+                    size=18,
                     weight=ft.FontWeight.W_400,
+                    font_family="Poppins",
                     selectable=True,
                 ),
                 ft.Row([
                     ft.Text(
                         timestamp,
                         color=timestamp_color,
-                        size=11,
+                        size=12,
+                        font_family="Poppins",
                     ),
                 ], alignment=ft.MainAxisAlignment.END),
-            ], spacing=8),
+            ], spacing=10),
             gradient=None,
             bgcolor="#0F1822BB",  # tono gris azulado semitransparente tipo glass
-            border_radius=18,
-            padding=15,
+            border_radius=20,
+            padding=22,
             opacity=0,
             animate_opacity=ft.Animation(400, ft.AnimationCurve.EASE_IN),
             margin=ft.Margin.only(bottom=10),
@@ -426,6 +429,9 @@ class OJOZApp:
         self.page = page
         page.title = "OJOZ - AI Vision Assistant"
         page.theme_mode = ft.ThemeMode.DARK
+        page.fonts = {
+            "Poppins": "https://raw.githubusercontent.com/google/fonts/master/ofl/poppins/Poppins-Regular.ttf",
+        }
         page.padding = 0
         page.window.resizable = True
         page.bgcolor = "#9CA0A5"  # Fondo azul oscuro premium
@@ -445,7 +451,7 @@ class OJOZApp:
                             size=42,
                             weight=ft.FontWeight.W_900,
                             color="#F28D35",
-                            font_family="Segoe UI",
+                            font_family="Poppins",
                             text_align=ft.TextAlign.CENTER,
                             style=ft.TextStyle(
                                 letter_spacing=2,
@@ -456,7 +462,7 @@ class OJOZApp:
                             size=20,
                             color="#D3833C",
                             weight=ft.FontWeight.W_500,
-                            font_family="Segoe UI",
+                            font_family="Poppins",
                             text_align=ft.TextAlign.CENTER,
                             italic=True,
                             style=ft.TextStyle(
@@ -617,42 +623,16 @@ class OJOZApp:
                     bgcolor="transparent",
                     padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
                     margin=ft.Margin.only(left=20, right=20, top=0, bottom=20),
-                    border_radius=ft.BorderRadius.all(30),
-                    clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-                    shadow=ft.BoxShadow(
-                        spread_radius=0,
-                        blur_radius=35,
-                        color="#0D1F2320",
-                        offset=ft.Offset(0, 10),
-                    ),
                 ),
-                # Globo de diálogo con forma de burbuja de chat y triángulo
-                ft.Stack([
-                    # Triángulo apuntando hacia OJOZ (pico del globo) - simulado con Container rotado
-                    ft.Container(
-                        width=20,
-                        height=20,
-                        gradient=ft.LinearGradient(
-                            begin=ft.Alignment.TOP_LEFT,
-                            end=ft.Alignment.BOTTOM_RIGHT,
-                            colors=["#1a1f3a", "#0f1729"],
-                        ),
-                        border=ft.Border.only(
-                            top=ft.BorderSide(3, "#0D1F23"),
-                            left=ft.BorderSide(3, "#0D1F23"),
-                        ),
-                        rotate=ft.Rotate(angle=-0.785398),  # -45 grados en radianes
-                        left=-10,
-                        top=50,
-                    ),
-                    # Contenido del globo
-                    ft.Container(
+                # Texto de presentación
+                ft.Container(
                         content=ft.Column([
                             ft.Text(
                                 "¡Hola! Soy OJOZ",
                                 size=28,
                                 weight=ft.FontWeight.BOLD,
                                 color="#8C311C",
+                                font_family="Poppins",
                             ),
                             ft.Container(height=10),
                             ft.Text(
@@ -661,6 +641,7 @@ class OJOZApp:
                                 color="#F2B33D",
                                 weight=ft.FontWeight.W_500,
                                 italic=True,
+                                font_family="Poppins",
                             ),
                             ft.Container(height=15),
                             ft.Text(
@@ -668,32 +649,23 @@ class OJOZApp:
                                 size=16,
                                 color="#F2D43D",
                                 weight=ft.FontWeight.W_600,
+                                font_family="Poppins",
                             ),
                             ft.Container(height=10),
                             ft.Column([
-                                ft.Text("Lectura de documentos", size=14, color="#ffffff"),
-                                ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff"),
-                                ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff"),
-                                ft.Text("Todo en uno", size=14, color="#ffffff"),
+                                ft.Text("Lectura de documentos", size=14, color="#ffffff", font_family="Poppins"),
+                                ft.Text("Identificación de billetes y monedas", size=14, color="#ffffff", font_family="Poppins"),
+                                ft.Text("Verificación de fechas de vencimiento", size=14, color="#ffffff", font_family="Poppins"),
+                                ft.Text("Todo en uno", size=14, color="#ffffff", font_family="Poppins"),
                             ], spacing=8),
                         ], spacing=0),
                         bgcolor="transparent",
                         border_radius=25,
                         padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
                     ),
-                ], expand=False),
             ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=10),
-            bgcolor="#132E3565",
+            bgcolor="transparent",
             padding=ft.Padding.only(left=10, right=10, top=0, bottom=10),
-            margin=ft.Margin.only(left=20, right=20, top=0, bottom=20),
-            border_radius=ft.BorderRadius.all(30),
-            clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
-            shadow=ft.BoxShadow(
-                spread_radius=0,
-                blur_radius=35,
-                color="#0D1F2320",
-                offset=ft.Offset(0, 10),
-            ),
         )
 
         # Agregar la carta de presentación al chat

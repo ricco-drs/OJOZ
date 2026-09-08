@@ -65,7 +65,6 @@ class TTS:
             return
         try:
             self._ensure_mixer()
-            self._play_startup_sound()
         except Exception as exc:  # pragma: no cover - solo log
             logger.debug(f"No se pudo calentar mixer: {exc}")
 
@@ -291,26 +290,6 @@ class TTS:
         except Exception as exc:
             self._mixer_ready.clear()
             raise RuntimeError(f"No se pudo inicializar pygame.mixer: {exc}") from exc
-
-    def _play_startup_sound(self) -> None:
-        """
-        Reproduce un sonido de inicio si hay una ruta configurada
-        y el archivo existe (pensado para el ladrido de bienvenida).
-        """
-        sound_path = getattr(config, "startup_sound_path", None)
-        if not sound_path:
-            return
-        if not os.path.isfile(sound_path):
-            logger.debug(f"Sonido de inicio no encontrado en {sound_path}. Coloca el archivo antes de iniciar.")
-            return
-        played_any = False
-        for _ in range(3):
-            if self.play_sound_file(sound_path):
-                played_any = True
-            else:
-                break
-        if played_any:
-            logger.debug("Sonido de inicio reproducido 3 veces.")
 
     @staticmethod
     def _safe_remove(path: str) -> None:

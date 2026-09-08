@@ -145,7 +145,6 @@ class AppConfig:
     enable_barge_in: bool = False             # (reservado) barge-in
     rearm_stt_delay_ms: int = 400             # espera tras TTS antes de re-escuchar
     rearm_stt_failsafe_ms: int = 8000         # failsafe: fuerza reactivación si falta tts:end
-    startup_sound_path: Optional[str] = None  # ruta al audio de arranque (mp3/wav)
 
 
 # Instancias de configuración global
@@ -225,9 +224,6 @@ _OCR_DIR = _DATA_DIR / "ocr"
 _CURRENCY_DIR = _DATA_DIR / "currency_refs"
 _MODEL_FILE = _MODELOS_DIR / "arcface_gallery.npz"
 _INSIGHTFACE_ROOT = _BASE_DIR / "assets" / "models" / "insightface"
-_STARTUP_SOUND_DIR = _BASE_DIR / "assets" / "sounds"
-_STARTUP_SOUND_WAV = _STARTUP_SOUND_DIR / "dog_bark.wav"
-_STARTUP_SOUND_MP3 = _STARTUP_SOUND_DIR / "dog_bark.mp3"
 
 # Crear las carpetas si no existen (idempotente)
 os.makedirs(_FOTOS_DIR, exist_ok=True)
@@ -235,16 +231,6 @@ os.makedirs(_MODELOS_DIR, exist_ok=True)
 os.makedirs(_OCR_DIR, exist_ok=True)
 os.makedirs(_CURRENCY_DIR, exist_ok=True)
 os.makedirs(_INSIGHTFACE_ROOT, exist_ok=True)
-os.makedirs(_STARTUP_SOUND_DIR, exist_ok=True)
-
-if config.startup_sound_path is None:
-    if _STARTUP_SOUND_MP3.exists():
-        config.startup_sound_path = str(_STARTUP_SOUND_MP3)
-    elif _STARTUP_SOUND_WAV.exists():
-        config.startup_sound_path = str(_STARTUP_SOUND_WAV)
-    else:
-        # Ruta por defecto si aún no hay archivo; se usará cuando exista.
-        config.startup_sound_path = str(_STARTUP_SOUND_WAV)
 
 # ===========================
 # OCR / TESSERACT
