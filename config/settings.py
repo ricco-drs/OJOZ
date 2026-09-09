@@ -115,6 +115,14 @@ class STTConfig:
     denoise_min_seconds: float = 0.3   # audios más cortos no se procesan
     denoise_max_seconds: float = 32.0  # cubre tambien las frases extendidas
 
+    # Transcripción con ElevenLabs Scribe (misma cuenta/clave que la voz de
+    # salida): mas robusta ante ruido de fondo que el endpoint gratuito de
+    # Google. Se usa como motor principal si hay ELEVENLABS_API_KEY; si falla
+    # por credenciales o saldo se desactiva por el resto de la sesion y se
+    # sigue con Google, sin interrumpir el servicio.
+    elevenlabs_stt_model: str = "scribe_v1"
+    elevenlabs_timeout_seconds: float = 20.0
+
 
 @dataclass
 class LLMConfig:

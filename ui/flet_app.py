@@ -222,6 +222,14 @@ class OJOZApp:
             "microfono listo, intenta nuevamente",
             "No pude leer la fecha de vencimiento",
             "No pude leer la fecha de vencimiento con claridad",
+            "No se pudo calibrar el microfono",
+            "No se pudo grabar del microfono",
+            "No se pudo leer el microfono",
+            "El microfono capta audio, pero no se pudo conectar",
+            "No se detecta tu voz. Comprueba que el microfono",
+            "Se recibe audio, pero no se entienden las palabras",
+            "No se pudo transcribir el audio",
+            "ElevenLabs STT no disponible",
         ]
         
         # Verificar si el mensaje debe ocultarse del chat (solo roles técnicos)
@@ -744,7 +752,7 @@ class OJOZApp:
             weight=ft.FontWeight.W_600,
             font_family="Poppins",
         )
-        self.mic_status_badge = ft.Container(
+        mic_pill = ft.Container(
             content=ft.Row([self.mic_icon, self.mic_label], spacing=8, tight=True),
             bgcolor="#1a1f3aE0",
             border_radius=20,
@@ -755,16 +763,137 @@ class OJOZApp:
                 color="#00000050",
                 offset=ft.Offset(0, 4),
             ),
+        )
+        settings_button = ft.Container(
+            content=ft.Icon(ft.Icons.SETTINGS, color="#AFB3B7", size=20),
+            bgcolor="#1a1f3aE0",
+            border_radius=20,
+            width=40,
+            height=40,
+            alignment=ft.Alignment.CENTER,
+            shadow=ft.BoxShadow(
+                spread_radius=0,
+                blur_radius=15,
+                color="#00000050",
+                offset=ft.Offset(0, 4),
+            ),
+            on_click=self._open_audio_settings,
+            tooltip="Configurar micrófono y altavoz",
+            ink=True,
+        )
+        self.mic_status_badge = ft.Container(
+            content=ft.Row([settings_button, mic_pill], spacing=10),
             top=130,
             right=20,
             animate=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
         )
         self.event_bus.subscribe("mic:state", self._on_mic_state)
 
+        self._build_audio_settings_dialog()
+        page.overlay.append(self.audio_settings_dialog)
+
         page.add(ft.Stack([main_container, self.mic_status_badge], expand=True))
 
         # Forzar actualización y maximizar después de agregar contenido
         page.update()
+
+    # -----------------------------
+    # Panel de ajustes de audio (micrófono / altavoz)
+    # -----------------------------
+    def _build_audio_settings_dialog(self) -> None:
+        self.mic_dropdown = ft.Dropdown(
+            label="Micrófono",
+            options=[],
+            border_color="#0D1F2330",
+            focused_border_color="#F2B33D",
+        )
+        self.speaker_dropdown = ft.Dropdown(
+            label="Altavoz",
+            options=[],
+            border_color="#0D1F2330",
+            focused_border_color="#F2B33D",
+        )
+        self.audio_settings_status = ft.Text("", size=12, color="#00f5a0")
+
+        self.audio_settings_dialog = ft.AlertDialog(
+            modal=True,
+            bgcolor="#132E35",
+            title=ft.Text(
+                "Configuración de audio",
+                font_family="Poppins",
+                weight=ft.FontWeight.BOLD,
+                color="#ffffff",
+            ),
+            content=ft.Column(
+                [
+                    ft.Text(
+                        "Elige qué micrófono y qué altavoz debe usar OJOZ.",
+                        size=13,
+                        color="#AFB3B7",
+                        font_family="Poppins",
+                    ),
+                    ft.Container(height=14),
+                    self.mic_dropdown,
+                    ft.Container(height=14),
+                    self.speaker_dropdown,
+                    ft.Container(height=8),
+                    self.audio_settings_status,
+                ],
+                tight=True,
+                width=360,
+            ),
+            actions=[
+                ft.TextButton("Cerrar", on_click=self._close_audio_settings),
+                ft.FilledButton(
+                    "Aplicar",
+                    icon=ft.Icons.CHECK,
+                    on_click=self._apply_audio_settings,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+    def _open_audio_settings(self, e: ft.ControlEvent) -> None:
+        if not self.controller:
+            return
+
+        mic_options = []
+        current_mic = self.controller.stt.get_device_index()
+        for device in self.controller.stt.list_input_devices():
+            mic_options.append(ft.DropdownOption(key=str(device["index"]), text=device["name"]))
+        self.mic_dropdown.options = mic_options
+        self.mic_dropdown.value = str(current_mic) if current_mic is not None else None
+
+        speaker_options = [ft.DropdownOption(key="", text="Predeterminado del sistema")]
+        current_speaker = self.controller.tts.get_output_device()
+        for name in self.controller.tts.list_output_devices():
+            speaker_options.append(ft.DropdownOption(key=name, text=name))
+        self.speaker_dropdown.options = speaker_options
+        self.speaker_dropdown.value = current_speaker or ""
+
+        self.audio_settings_status.value = ""
+        self.audio_settings_dialog.open = True
+        self.page.update()
+
+    def _close_audio_settings(self, e: ft.ControlEvent) -> None:
+        self.audio_settings_dialog.open = False
+        self.page.update()
+
+    def _apply_audio_settings(self, e: ft.ControlEvent) -> None:
+        if not self.controller:
+            return
+
+        if self.mic_dropdown.value is not None:
+            try:
+                self.controller.stt.set_device_index(int(self.mic_dropdown.value))
+            except (TypeError, ValueError):
+                pass
+
+        speaker_value = self.speaker_dropdown.value or None
+        self.controller.tts.set_output_device(speaker_value)
+
+        self.audio_settings_status.value = "Aplicado ✓"
+        self.page.update()
 
     def _on_mic_state(self, **kwargs) -> None:
         """Actualiza el indicador flotante segun encienda/apague el microfono."""

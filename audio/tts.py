@@ -52,6 +52,7 @@ class TTS:
 
         self._play_lock = threading.RLock()
         self._mixer_ready = threading.Event()
+        self._output_device: str | None = None
 
         self._worker = threading.Thread(target=self._loop, daemon=True)
         self._worker.start()
@@ -284,12 +285,58 @@ class TTS:
         if pygame is None or self._mixer_ready.is_set():
             return
         try:
-            pygame.mixer.init()
+            if self._output_device:
+                pygame.mixer.init(devicename=self._output_device)
+            else:
+                pygame.mixer.init()
             self._mixer_ready.set()
             logger.debug("Mixer de pygame inicializado una sola vez.")
         except Exception as exc:
             self._mixer_ready.clear()
             raise RuntimeError(f"No se pudo inicializar pygame.mixer: {exc}") from exc
+
+    # -----------------------------
+    # Seleccion de altavoz en vivo (panel de ajustes)
+    # -----------------------------
+    def list_output_devices(self) -> list[str]:
+        """Altavoces/salidas de audio reales disponibles en este equipo."""
+        if pygame is None:
+            return []
+        try:
+            from pygame._sdl2 import audio as sdl2_audio
+
+            self._ensure_mixer()
+            return list(sdl2_audio.get_audio_device_names(False))
+        except Exception as exc:
+            logger.debug(f"No se pudieron listar los altavoces: {exc}")
+            return []
+
+    def get_output_device(self) -> str | None:
+        return self._output_device
+
+    def set_output_device(self, name: str | None) -> None:
+        """
+        Cambia el altavoz de salida en caliente. Corta cualquier audio en
+        curso y reinicia el mixer apuntando al dispositivo elegido (None
+        vuelve al predeterminado del sistema).
+        """
+        if pygame is None or name == self._output_device:
+            return
+        with self._play_lock:
+            self._output_device = name
+            try:
+                if pygame.mixer.get_init():
+                    pygame.mixer.music.stop()
+                    pygame.mixer.quit()
+                self._mixer_ready.clear()
+                self._ensure_mixer()
+            except Exception as exc:
+                logger.warning(f"No se pudo cambiar el altavoz de salida: {exc}")
+                event_bus.publish(
+                    "ui:print",
+                    role="sys",
+                    text=f"No se pudo usar ese altavoz, se mantiene el anterior: {exc}",
+                )
 
     @staticmethod
     def _safe_remove(path: str) -> None:

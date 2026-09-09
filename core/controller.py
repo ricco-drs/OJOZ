@@ -30,6 +30,7 @@ from app.vision.currency import detect_currency_best_frame
 from app.vision.expiry import check_expiry_best_frame
 # === ESCENA (descripción independiente) ===
 from app.vision.scene import describe_scene_best_frame
+from app.vision.camera_service import camera_service
 
 from app.core.router import infer_intent
 from app.core.llm_agent import LLMAgent
@@ -147,7 +148,7 @@ class Controller:
                 ok, recognized_name, conf = False, None, None
             if ok and recognized_name:
                 self._user_name = recognized_name
-                self._authenticated = True
+                self._mark_authenticated()
                 return f"Se reconoció a {recognized_name}. Ya está identificado y puede usar las funciones."
             return (
                 "No se reconoció ningún rostro conocido: es una persona nueva. "
@@ -203,6 +204,7 @@ class Controller:
             self._conversation_state = None
             # El historial se limpia al terminar el turno, no en mitad de él.
             self._llm_reset_pending = True
+            self._end_session_camera()
             return f"Sesión de {nombre} cerrada. Despídete brevemente."
 
         def cerrar_aplicacion() -> str:
@@ -241,6 +243,23 @@ class Controller:
             old = self.state
             self.state = new_state
         event_bus.publish("ctrl:state", from_state=old, to=new_state)
+
+    # -----------------------------
+    # Camara de sesion
+    # -----------------------------
+    def _mark_authenticated(self) -> None:
+        """
+        Marca la sesion como autenticada y enciende la camara compartida.
+
+        A partir de aqui, leer_documento/identificar_dinero/verificar_vencimiento/
+        describir_escena ya no abren ni cierran la camara en cada peticion: la
+        dejan encendida en un hilo secundario mientras dure la sesion.
+        """
+        self._authenticated = True
+        camera_service.start()
+
+    def _end_session_camera(self) -> None:
+        camera_service.stop()
 
     # -----------------------------
     # Utilidades internas
@@ -532,7 +551,7 @@ class Controller:
             # enrolamiento facial no es viable (poca luz, sin camara, etc.).
             # No usar en la demo real: no verifica identidad.
             self._user_name = dev_login
-            self._authenticated = True
+            self._mark_authenticated()
             self._introduction = f"Modo de pruebas activo. Sesión iniciada como {dev_login}. ¿En qué puedo ayudarte?"
             self.speak(self._introduction)
             return
@@ -949,6 +968,7 @@ class Controller:
             self._conversation_state = None
             self._pending_enroll_after_tts = False
             self._pending_auth_after_tts = False
+            self._end_session_camera()
 
             # Programar reinicio del flujo tras la despedida
             import time
@@ -1152,6 +1172,7 @@ class Controller:
     def stop(self):
         self._watch_stop.set()
         self._cancel_fallback_rearm()
+        camera_service.stop()
 
     # =============================
     # NUEVOS WORKFLOWS (visión)
@@ -1255,7 +1276,7 @@ class Controller:
             if ya_existe and nombre_existente:
                 event_bus.publish("camera.closed", index=vision.camera_index)
                 self._user_name = nombre_existente
-                self._authenticated = True
+                self._mark_authenticated()
                 event_bus.publish("ui:print", role="sys", text=f"[OK] Ya tenia cuenta: {nombre_existente}")
                 self.speak(f"Ya tienes una cuenta, {nombre_existente}. ¿En qué puedo ayudarte?")
                 return
@@ -1331,7 +1352,7 @@ class Controller:
             event_bus.publish("ui:print", role="sys", text=f"[OK] Usuario '{name}' registrado exitosamente en la base de datos")
 
             self._user_name = name
-            self._authenticated = True
+            self._mark_authenticated()
             self._conversation_state = None
             return f"Listo, {name}. Tu cuenta ha sido creada satisfactoriamente. ¿En qué puedo ayudarte?"
         except Exception as e:
@@ -1372,7 +1393,7 @@ class Controller:
 
             if ok and recognized_name:
                 self._user_name = recognized_name
-                self._authenticated = True
+                self._mark_authenticated()
                 event_bus.publish("ui:print", role="sys", text=f"[OK] Identidad reconocida: {recognized_name}")
                 self.speak(f"¡Hola de nuevo, {recognized_name}! ¿En qué puedo ayudarte?")
             else:
@@ -1418,7 +1439,7 @@ class Controller:
                 # Se reconoció un rostro
                 if self._user_name and recognized_name.lower() == self._user_name.lower():
                     # El nombre coincide con el esperado
-                    self._authenticated = True  # Marcar como autenticado
+                    self._mark_authenticated()  # Marcar como autenticado
                     event_bus.publish("ui:print", role="sys", text=f"[OK] Autenticación exitosa: {self._user_name}")
                     if llm_mode:
                         return f"Identidad verificada: es {self._user_name}. Ya puede usar las funciones."

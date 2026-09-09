@@ -17,7 +17,7 @@ from typing import Optional, Tuple
 import cv2
 
 from app.config.settings import llm as llm_config, vision
-from app.vision.camera import rotate_frame
+from app.vision.camera_service import frames_for
 
 _PROMPT = (
     "Describe brevemente en espanol, en dos o tres frases, lo que se ve en "
@@ -84,36 +84,27 @@ def describe_scene_best_frame(seconds: float = 5.0) -> Tuple[bool, Optional[str]
     if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
         return False, None
 
-    cap = cv2.VideoCapture(getattr(vision, "camera_index", 0), cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        return False, None
-
     frame = None
-    try:
-        t0 = time.time()
-        while time.time() - t0 < seconds:
-            ret, current = cap.read()
-            if not ret:
+    t0 = time.time()
+    for current in frames_for(seconds):
+        frame = current
+        if getattr(vision, "show_preview", False):
+            show = frame.copy()
+            time_left = int(seconds - (time.time() - t0)) + 1
+            cv2.putText(
+                show,
+                f"Describiendo el entorno - {time_left}s",
+                (40, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.imshow("Descripcion de escena", show)
+            if cv2.waitKey(1) & 0xFF == 27:
                 break
-            frame = rotate_frame(current)
-            if getattr(vision, "show_preview", False):
-                show = frame.copy()
-                time_left = int(seconds - (time.time() - t0)) + 1
-                cv2.putText(
-                    show,
-                    f"Describiendo el entorno - {time_left}s",
-                    (40, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 255, 0),
-                    3,
-                    cv2.LINE_AA,
-                )
-                cv2.imshow("Descripcion de escena", show)
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
-    finally:
-        cap.release()
+    if getattr(vision, "show_preview", False):
         cv2.destroyAllWindows()
 
     if frame is None:

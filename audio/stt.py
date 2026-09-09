@@ -1,9 +1,16 @@
 from __future__ import annotations
 import audioop
+import binascii
+import json
+import os
 import re
 import threading
 import time
 import traceback
+import wave
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
 import speech_recognition as sr
 
 from app.audio.denoise import TARGET_SAMPLE_RATE, denoiser
@@ -18,6 +25,12 @@ class _SilenceDetected(Exception):
 
 class _ListeningInterrupted(Exception):
     pass
+
+
+class ElevenLabsSTTError(RuntimeError):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(f"ElevenLabs STT HTTP {status_code}: {detail}")
+        self.status_code = status_code
 
 
 class _PhraseSource(sr.AudioSource):
@@ -128,6 +141,7 @@ class STT:
         self._calibrated = False
         self._empty_results = 0
         self._warned_google = False
+        self._elevenlabs_stt_disabled = False
         self._last_logged_device_index: int | None = None
         self._has_logged_mic = False
         self._last_error_message = ""
@@ -226,6 +240,38 @@ class STT:
     def is_capturing(self) -> bool:
         return self._capturing.is_set()
 
+    # -----------------------------
+    # Seleccion de microfono en vivo (panel de ajustes)
+    # -----------------------------
+    def list_input_devices(self) -> list[dict]:
+        """Microfonos reales disponibles, ordenados con el actual primero si aplica."""
+        try:
+            devices = input_devices()
+        except Exception as exc:
+            logger.debug(f"No se pudieron listar microfonos: {exc}")
+            return []
+        return [
+            {"index": d["index"], "name": d.get("name") or f"Dispositivo {d['index']}"}
+            for d in devices
+        ]
+
+    def get_device_index(self) -> int | None:
+        return self._device_index
+
+    def set_device_index(self, index: int) -> None:
+        """
+        Cambia el microfono en caliente. Recalibra el ruido ambiente del
+        nuevo dispositivo en un hilo aparte (tarda ~1.5s) para no bloquear la
+        interfaz mientras se aplica el cambio.
+        """
+        if index == self._configured_device_index:
+            return
+        self._device_index = index
+        self._configured_device_index = index
+        self._calibrated = False
+        self._has_logged_mic = False
+        threading.Thread(target=self._calibrate_microphone, daemon=True).start()
+
     def enable_listening(self, value: bool) -> None:
         if value and self._manual_mode:
             # En modo manual, solo set_push_to_talk (la tecla de espacio)
@@ -310,14 +356,40 @@ class STT:
             logger.debug(f"No se pudo armar el audio grabado: {exc}")
             return
 
+        duration = self._estimate_duration(audio)
+        rms = self._compute_rms(audio)
+        logger.debug(f"PTT grabado: {duration:.2f}s, rms={rms:.1f}")
+        self._save_ptt_debug_wav(audio, "ptt_original.wav")
+
         cleaned = self._denoise(audio)
-        text, conf = self._recognize_with_google(cleaned)
+        if cleaned is not audio:
+            logger.debug(f"PTT tras supresion de ruido: rms={self._compute_rms(cleaned):.1f}")
+            self._save_ptt_debug_wav(cleaned, "ptt_filtrado.wav")
+
+        text, conf = self._recognize(cleaned)
         if not text and cleaned is not audio and not self._recognition_failed:
-            text, conf = self._recognize_with_google(audio)
+            text, conf = self._recognize(audio)
 
         text = (text or "").strip()
         if text:
             event_bus.publish("stt:text", text=text, confidence=conf)
+        else:
+            logger.debug("PTT: ningun motor pudo transcribir la grabacion.")
+
+    @staticmethod
+    def _save_ptt_debug_wav(audio: sr.AudioData, filename: str) -> None:
+        """Guarda la ultima captura para poder escucharla y comparar (sobreescribe)."""
+        try:
+            from app.config.settings import vision
+            out_dir = vision.data_dir / "audio_check"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(out_dir / filename), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(audio.sample_width)
+                wf.setframerate(audio.sample_rate)
+                wf.writeframes(audio.get_raw_data())
+        except Exception as exc:
+            logger.debug(f"No se pudo guardar wav de depuracion: {exc}")
 
     # -----------------------------
     # Calibracion y energia
@@ -680,6 +752,90 @@ class STT:
             self._report_error(f"No se pudo transcribir el audio: {e}")
             return "", None
 
+    def _recognize_with_elevenlabs(self, audio: sr.AudioData) -> tuple[str, float | None]:
+        """Transcribe con ElevenLabs Scribe, usando la misma clave que la voz de salida."""
+        api_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("Falta ELEVENLABS_API_KEY")
+
+        model_id = os.environ.get(
+            "ELEVENLABS_STT_MODEL",
+            getattr(stt_config, "elevenlabs_stt_model", "scribe_v1"),
+        ).strip() or "scribe_v1"
+        wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+
+        boundary = binascii.hexlify(os.urandom(16)).decode()
+        body = bytearray()
+        body += (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="model_id"\r\n\r\n'
+            f'{model_id}\r\n'
+        ).encode()
+        body += (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            f'Content-Type: audio/wav\r\n\r\n'
+        ).encode()
+        body += wav_bytes
+        body += f'\r\n--{boundary}--\r\n'.encode()
+
+        request = Request(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            data=bytes(body),
+            headers={
+                "xi-api-key": api_key,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(
+                request,
+                timeout=getattr(stt_config, "elevenlabs_timeout_seconds", 20.0),
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = f"HTTP {exc.code}"
+            try:
+                payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+                api_detail = payload.get("detail", {})
+                if isinstance(api_detail, dict):
+                    detail = api_detail.get("message") or api_detail.get("code") or detail
+                elif api_detail:
+                    detail = str(api_detail)
+            except (ValueError, OSError):
+                pass
+            raise ElevenLabsSTTError(exc.code, detail) from exc
+        except URLError as exc:
+            raise RuntimeError("No se pudo conectar con ElevenLabs") from exc
+
+        return (result.get("text") or "").strip(), None
+
+    def _recognize(self, audio: sr.AudioData) -> tuple[str, float | None]:
+        """
+        Motor principal de transcripción, con Google como respaldo gratuito.
+
+        ElevenLabs Scribe usa la misma cuenta que la voz de salida y es mas
+        robusto ante ruido de fondo. Si falla por credenciales o saldo se
+        desactiva por el resto de la sesion (no tiene sentido reintentar en
+        cada frase) y se sigue con Google sin interrumpir el servicio.
+        """
+        elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+        if elevenlabs_key and not self._elevenlabs_stt_disabled:
+            try:
+                text, _ = self._recognize_with_elevenlabs(audio)
+                self._recognition_failed = False
+                if text:
+                    text = self._apply_custom_normalization(text)
+                return text, None
+            except Exception as exc:
+                if isinstance(exc, ElevenLabsSTTError) and exc.status_code in {401, 402, 403, 404}:
+                    self._elevenlabs_stt_disabled = True
+                    self._report_error(
+                        "ElevenLabs STT no disponible, se usa Google Speech como respaldo."
+                    )
+                logger.warning(f"ElevenLabs STT fallo, intentando Google: {exc}")
+
+        return self._recognize_with_google(audio)
+
     def _report_error(self, message: str) -> None:
         if message != self._last_error_message:
             event_bus.publish("ui:print", role="sys", text=message)
@@ -721,10 +877,15 @@ class STT:
 
             try:
                 if not self._warned_google:
+                    engine_name = (
+                        "ElevenLabs Scribe"
+                        if os.environ.get("ELEVENLABS_API_KEY", "").strip()
+                        else "Google Speech"
+                    )
                     event_bus.publish(
                         "ui:print",
                         role="sys",
-                        text="Usando Google Speech para transcribir (requiere internet).",
+                        text=f"Usando {engine_name} para transcribir (requiere internet).",
                     )
                     self._warned_google = True
 
@@ -768,9 +929,9 @@ class STT:
                 # Solo se limpia lo que ya se considera voz: ahorra CPU y evita
                 # procesar ruido que igualmente se iba a descartar.
                 logger.debug(f"Voz capturada: {self._estimate_duration(audio):.1f}s, rms={self._compute_rms(audio):.1f}")
-                text, conf = self._recognize_with_google(cleaned)
+                text, conf = self._recognize(cleaned)
                 if not text and cleaned is not audio and not self._recognition_failed:
-                    text, conf = self._recognize_with_google(audio)
+                    text, conf = self._recognize(audio)
 
             except _ListeningInterrupted:
                 continue

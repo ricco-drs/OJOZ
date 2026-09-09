@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.config.settings import configure_tesseract, vision
-from app.vision.camera import open_camera, read_frame, release
+from app.vision.camera_service import frames_for
 
 # Configurar Tesseract. La ruta esta centralizada en config.settings y se puede
 # sobreescribir con la variable de entorno TESSERACT_CMD. Si no se encuentra el
@@ -394,12 +394,10 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     """
     Muestra preview de la cámara, elige el frame más nítido y procesa OCR.
     """
-    cap = open_camera(vision.camera_index)
-
-    # Configurar cámara para mejor calidad
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
+    def _configure(cap):
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
     captured_frame = None
     best_frame = None
@@ -415,11 +413,9 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
         preview_time = max(seconds, 8.0)
         t0 = time.time()
 
-
         print("?? Posicione el documento frente a la camara...")
 
-        while time.time() - t0 < preview_time:
-            frame = read_frame(cap)
+        for frame in frames_for(preview_time, configure_capture=_configure):
             last_frame = frame.copy()
 
             score, focus, brightness, contrast = _frame_quality_score(frame)
@@ -466,14 +462,12 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
             _, best_focus, best_brightness, best_contrast = _frame_quality_score(captured_frame)
         elif best_frame is not None:
             captured_frame = best_frame
-        else:
-            captured_frame = read_frame(cap)
-            _, best_focus, best_brightness, best_contrast = _frame_quality_score(captured_frame)
 
-        print(f"?? Usando frame con nitidez={best_focus:.1f}, brillo={best_brightness:.1f}, contraste={best_contrast:.1f}")
+        if captured_frame is not None:
+            print(f"?? Usando frame con nitidez={best_focus:.1f}, brillo={best_brightness:.1f}, contraste={best_contrast:.1f}")
 
         # Mostrar la foto capturada por un instante
-        if vision.show_preview:
+        if vision.show_preview and captured_frame is not None:
             display = captured_frame.copy()
             cv2.putText(display, "FOTO CAPTURADA - Procesando...", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
@@ -481,7 +475,6 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
             cv2.waitKey(800)
 
     finally:
-        release(cap)
         try:
             cv2.destroyAllWindows()
         except Exception:
