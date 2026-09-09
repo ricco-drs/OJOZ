@@ -1,5 +1,16 @@
 import time
+from pathlib import Path
 from threading import Event
+
+# Carga las claves de API y variables opcionales desde un .env junto a este
+# archivo (ver main_flet.py para el detalle); tiene que ir antes de importar
+# app.config.settings (via los imports de abajo), que las lee al importarse.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass
 
 from app.ui.console_view import init_console_view
 from app.audio.tts import TTS

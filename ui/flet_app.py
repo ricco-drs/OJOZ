@@ -18,6 +18,7 @@ class OJOZApp:
         self.page = None
         self.chat_messages = None
         self.camera_preview = None
+        self.camera_container = None
         self.status_text = None
         self.status_badge = None
         self.camera_active = False
@@ -37,9 +38,10 @@ class OJOZApp:
         self.event_bus.subscribe("tts:start", self._on_tts_start)
         self.event_bus.subscribe("tts:end", self._on_tts_end)
         self.event_bus.subscribe("stt:text", self._on_stt_text)
-        self.event_bus.subscribe("camera:start", self._on_camera_start)
-        self.event_bus.subscribe("camera:stop", self._on_camera_stop)
-        
+        # La camara se muestra en una ventana de OpenCV aparte (con deteccion
+        # de personas y objetos en vivo), no dentro de la interfaz de Flet:
+        # _on_camera_start/_on_camera_stop quedan sin usar a proposito.
+
         print("[UI DEBUG] Event bus subscriptions registered!")
     
     # -----------------------------
@@ -229,9 +231,12 @@ class OJOZApp:
             "No se detecta tu voz. Comprueba que el microfono",
             "Se recibe audio, pero no se entienden las palabras",
             "No se pudo transcribir el audio",
-            "ElevenLabs STT no disponible",
+            # Regla general: cualquier aviso tecnico que mencione ElevenLabs
+            # (fallas de la voz o de la transcripcion) es solo para consola,
+            # sin importar como cambie la redaccion exacta del mensaje.
+            "elevenlabs",
         ]
-        
+
         # Verificar si el mensaje debe ocultarse del chat (solo roles técnicos)
         if role not in ("app/tts", "user"):
             # Regla genérica: cualquier mensaje de estado con prefijo tipo
@@ -320,45 +325,54 @@ class OJOZApp:
         if self.camera_preview and self.page:
             def update():
                 self.camera_preview.visible = True
+                if self.camera_container:
+                    self.camera_container.visible = True
                 self.page.update()
-            
+
             self._run_on_ui(update)
-            
+
             # Iniciar thread de actualización de preview
             if not self.preview_thread or not self.preview_thread.is_alive():
                 self.preview_thread = Thread(target=self._update_camera_preview, daemon=True)
                 self.preview_thread.start()
-    
+
     def _on_camera_stop(self, **kwargs):
         """Desactivar preview de cámara"""
         self.camera_active = False
         if self.camera_preview and self.page:
             def update():
                 self.camera_preview.visible = False
+                if self.camera_container:
+                    self.camera_container.visible = False
                 self.page.update()
             
             self._run_on_ui(update)
     
     def _update_camera_preview(self):
-        """Actualizar preview de cámara en tiempo real"""
-        cap = cv2.VideoCapture(0)
-        while self.camera_active and cap.isOpened():
-            ret, frame = cap.read()
-            if ret:
-                # Redimensionar para preview
+        """
+        Actualizar preview de cámara en tiempo real.
+
+        Lee de la cámara compartida de sesión (camera_service) en vez de abrir
+        su propio cv2.VideoCapture: Windows solo deja que un proceso tenga el
+        dispositivo abierto a la vez, así que un segundo "open" aparte fallaba
+        en silencio y la previsualización nunca aparecía.
+        """
+        from app.vision.camera_service import camera_service
+
+        while self.camera_active:
+            frame = camera_service.get_frame()
+            if frame is not None:
                 frame = cv2.resize(frame, (320, 240))
-                # Convertir a base64 para mostrar en Flet
                 _, buffer = cv2.imencode('.jpg', frame)
                 img_base64 = base64.b64encode(buffer).decode()
-                
+
                 if self.camera_preview and self.page:
                     def update_preview():
                         self.camera_preview.src = f"data:image/jpeg;base64,{img_base64}"
                         self.page.update()
-                    
+
                     self._run_on_ui(update_preview)
             time.sleep(0.1)  # 10 FPS
-        cap.release()
     
     def add_message(self, text, is_user=False):
         """Agregar mensaje al chat con diseño premium y animaciones"""
@@ -656,6 +670,7 @@ class OJOZApp:
             padding=15,
             visible=False,  # Oculto por defecto hasta que se active la cámara
         )
+        self.camera_container = camera_container
         
 
         

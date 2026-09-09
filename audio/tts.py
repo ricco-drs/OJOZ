@@ -168,6 +168,17 @@ class TTS:
                 "text": text,
                 "model_id": model_id,
                 "language_code": "es",
+                # Sin esto, ElevenLabs usa sus valores por defecto, que en
+                # conversacion tienden a sonar apurados y acortan las pausas
+                # de puntuacion. speed < 1.0 calma el ritmo; stability/style
+                # moderados mantienen una entonacion natural y consistente.
+                "voice_settings": {
+                    "stability": getattr(tts_config, "elevenlabs_stability", 0.5),
+                    "similarity_boost": getattr(tts_config, "elevenlabs_similarity_boost", 0.75),
+                    "style": getattr(tts_config, "elevenlabs_style", 0.35),
+                    "use_speaker_boost": True,
+                    "speed": getattr(tts_config, "elevenlabs_speed", 0.92),
+                },
             }
         ).encode("utf-8")
         request = Request(

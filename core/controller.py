@@ -23,7 +23,7 @@ from app.utils.fs import write_display_name
 from app.db import dao
 # ==========================
 # === OCR (Opción 1) ===
-from app.vision.ocr import read_text_best_frame
+from app.vision.ocr import read_text_best_frame, summarize_document_text
 # === CURRENCY (Opción 2) ===
 from app.vision.currency import detect_currency_best_frame
 # === EXPIRY (Opción 3) ===
@@ -36,9 +36,6 @@ from app.core.router import infer_intent
 from app.core.llm_agent import LLMAgent
 
 State = Literal["IDLE", "TTS_SPEAKING", "LISTENING", "PROCESSING"]
-
-# Nombre hablado de cada divisa que puede detectar vision/currency.py
-_CURR_TO_UNIT = {"PEN": "soles", "USD": "dólares"}
 
 class Controller:
     """
@@ -66,6 +63,9 @@ class Controller:
         # Para Opción 1 (OCR)
         self._pending_ocr_after_tts: bool = False
         self._ocr_capture_seconds: float | None = None
+        # Texto ya leido de un documento, esperando a que la persona diga si
+        # quiere un resumen o el contenido completo (ver entregar_documento).
+        self._pending_ocr_text: str | None = None
         # Para Opción 2 (Currency/Dinero)
         self._pending_currency_after_tts: bool = False
         # Para Opción 3 (Expiry/Vencimiento)
@@ -76,6 +76,10 @@ class Controller:
         # Identificacion por rostro antes de preguntar nombre (evita choques
         # de nombres repetidos: el rostro decide si es alguien nuevo o no).
         self._pending_identify_after_tts: bool = False
+        # Reintentos cuando no se detecta ningun rostro (no cuando se detecta
+        # uno y no coincide): evita asumir "persona nueva" solo porque no
+        # llego a acomodarse a tiempo frente a la camara.
+        self._identify_retry_count: int = 0
         # Usuario nuevo: primero se captura el rostro, el apodo se pregunta
         # despues (para no atarse a un nombre antes de tener las fotos).
         self._pending_enroll_capture_after_tts: bool = False
@@ -134,7 +138,7 @@ class Controller:
             try:
                 return float(max(5, min(int(segundos), 60)))
             except (TypeError, ValueError):
-                return 10.0
+                return 5.0
 
         def identificar_usuario() -> str:
             self.tts.join()
@@ -142,18 +146,49 @@ class Controller:
             # que el modelo decida avisarlo por su cuenta.
             self.speak("Posiciónate bien frente a la cámara para poder reconocerte.")
             self.tts.join()
-            try:
-                ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
-            except FileNotFoundError:
-                ok, recognized_name, conf = False, None, None
-            if ok and recognized_name:
-                self._user_name = recognized_name
-                self._mark_authenticated()
-                return f"Se reconoció a {recognized_name}. Ya está identificado y puede usar las funciones."
-            return (
-                "No se reconoció ningún rostro conocido: es una persona nueva. "
-                "Pregúntale su nombre y usa registrar_usuario para crearle una cuenta."
-            )
+
+            # El reintento ante "no hay nadie en camara" ocurre aqui mismo,
+            # sin depender de que el modelo decida volver a llamar a esta
+            # funcion: asi nunca se le pregunta el nombre a alguien que ni
+            # siquiera llego a acomodarse frente a la camara.
+            intentos_sin_rostro = 0
+            while True:
+                try:
+                    ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
+                except FileNotFoundError:
+                    ok, recognized_name, conf = False, None, None
+
+                from app.utils.logger import logger as _logger
+                _logger.debug(
+                    f"identificar_usuario: ok={ok}, nombre={recognized_name}, "
+                    f"confianza={conf}, umbral={vision.face_similarity_threshold}"
+                )
+
+                if ok and recognized_name:
+                    self._user_name = recognized_name
+                    self._mark_authenticated()
+                    return f"Se reconoció a {recognized_name}. Ya está identificado y puede usar las funciones."
+
+                if conf is not None:
+                    # Se detecto un rostro real, solo que no coincide con
+                    # ninguna cuenta: recien aqui es una persona nueva.
+                    return (
+                        "Se detectó un rostro pero no coincide con ninguna cuenta "
+                        "registrada: es una persona nueva. "
+                        "Pregúntale su nombre y usa registrar_usuario para crearle una cuenta."
+                    )
+
+                # conf is None: no se detecto ningun rostro (no que se detecto
+                # uno y no coincidio). No asumir que es nueva todavia.
+                if intentos_sin_rostro >= 2:
+                    return (
+                        "No se detecta a nadie frente a la cámara después de varios "
+                        "intentos. Pídele que se acomode bien y ofrécele intentarlo "
+                        "de nuevo cuando esté lista."
+                    )
+                intentos_sin_rostro += 1
+                self.speak("No hay nadie en la cámara. Por favor, posiciónate bien.")
+                self.tts.join()
 
         def registrar_usuario(nombre: str) -> str:
             nombre = self._extract_name(nombre) or nombre
@@ -173,11 +208,41 @@ class Controller:
             self.tts.join()
             return self._auth_workflow(llm_mode=True)
 
-        def leer_documento(segundos: int = 10) -> str:
+        def leer_documento(segundos: int = 5) -> str:
             if (error := _sesion_iniciada()) is not None:
                 return error
             self.tts.join()
             return self._ocr_workflow(capture_seconds=_segundos_validos(segundos), llm_mode=True)
+
+        def entregar_documento(modo: str) -> str:
+            """
+            Enuncia el documento que ya se leyo con leer_documento, recien
+            cuando la persona dice si quiere el resumen o el contenido
+            completo. El texto lo enuncia la aplicacion directamente (no el
+            modelo), para no reformular el contenido exacto salvo que se pida
+            explicitamente el resumen.
+            """
+            text = self._pending_ocr_text
+            if not text:
+                return (
+                    "No hay ningun documento leido esperando. Usa leer_documento "
+                    "primero."
+                )
+            self._pending_ocr_text = None
+            self.tts.join()
+
+            modo = (modo or "").strip().lower()
+            quiere_resumen = modo.startswith("resum") or modo in ("breve", "corto")
+
+            if quiere_resumen:
+                resumen = summarize_document_text(text)
+                self.speak(resumen)
+                return "Ya se le dijo a la persona de que trata el documento."
+
+            MAX_TTS_CHARS = 1200
+            spoken = text[:MAX_TTS_CHARS] + (" …" if len(text) > MAX_TTS_CHARS else "")
+            self.speak(spoken)
+            return "Ya se le leyó el contenido completo del documento a la persona."
 
         def identificar_dinero() -> str:
             if (error := _sesion_iniciada()) is not None:
@@ -223,6 +288,7 @@ class Controller:
             "registrar_usuario": registrar_usuario,
             "autenticar_usuario": autenticar_usuario,
             "leer_documento": leer_documento,
+            "entregar_documento": entregar_documento,
             "identificar_dinero": identificar_dinero,
             "verificar_vencimiento": verificar_vencimiento,
             "describir_escena": describir_escena,
@@ -390,45 +456,6 @@ class Controller:
             return int(m.group(1))
         except Exception:
             return None
-
-    def _is_new_user_utterance(self, raw_text: str) -> bool:
-        """
-        Detecta frases tipo "soy usuario nuevo" / "me quiero registrar".
-        """
-        t = (raw_text or "").lower()
-        return any(
-            kw in t
-            for kw in [
-                "usuario nuevo",
-                "soy nuevo",
-                "soy nueva",
-                "registr",
-                "crear una cuenta",
-                "crear mi cuenta",
-                "quiero registrarme",
-                "me voy a registrar",
-                "me voy a registro",
-                "me quiero registrar",
-            ]
-        )
-
-    def _is_existing_user_utterance(self, raw_text: str) -> bool:
-        """
-        Detecta frases tipo "ya tengo cuenta" mientras estamos pidiendo nombre de registro.
-        """
-        t = (raw_text or "").lower()
-        return any(
-            kw in t
-            for kw in [
-                "ya tengo cuenta",
-                "ya tengo una cuenta",
-                "ya estoy registrado",
-                "ya estoy registrada",
-                "no soy nuevo",
-                "no soy nueva",
-                "tengo cuenta",
-            ]
-        )
 
     # -----------------------------
     # Ciclo de vida
@@ -752,104 +779,6 @@ class Controller:
             self._pending_enroll_after_tts = True
             reply = f"Encantado, {self._user_name}."
 
-        elif self._conversation_state == "waiting_new_user_name":
-            lower = (text or "").lower()
-            if self._is_existing_user_utterance(lower):
-                # Corrige: dijo que ya tiene cuenta, cambiar al flujo de usuario recurrente
-                self._conversation_state = "waiting_returning_user_name"
-                self._user_name = None
-                reply = "Entiendo, ya tienes cuenta. ¿Cuál es tu nombre para verificar tu identidad?"
-            else:
-                # El usuario acaba de decirnos su nombre para registro
-                self._user_name = self._extract_name(text)
-                self._conversation_state = None  # Salir del flujo
-
-                # Verificar si el usuario ya está registrado en la BD
-                if dao.user_exists(self._user_name):
-                    # Usuario ya existe, redirigir a autenticación
-                    self._pending_auth_after_tts = True
-                    reply = "Tu ya tienes una cuenta creada."
-                else:
-                    # Usuario nuevo, proceder con captura y entrenamiento
-                    self._pending_enroll_after_tts = True
-                    reply = f"Encantado, {self._user_name}."
-        
-        elif self._conversation_state == "waiting_returning_user_name":
-            lower = (text or "").lower()
-            if self._is_new_user_utterance(lower):
-                # Corrige: si dice que quiere registrarse, saltar al flujo de registro
-                self._conversation_state = "waiting_new_user_name"
-                self._user_name = None
-                reply = "Entiendo, eres usuario nuevo. ¿Cómo te llamas para crear tu cuenta?"
-            else:
-                # El usuario que vuelve nos dijo su nombre
-                self._user_name = self._extract_name(text)
-                
-                # Verificar si el usuario existe en la base de datos
-                if dao.user_exists(self._user_name):
-                    # Usuario encontrado, proceder con autenticación facial
-                    self._conversation_state = None  # Salir del flujo
-                    self._pending_auth_after_tts = True
-                    reply = f"¡Un gusto tenerte de vuelta, {self._user_name}!"
-                else:
-                    # Usuario no encontrado: preguntar si desea registrarse
-                    self._conversation_state = "confirm_register_for_returning"
-                    reply = f"{self._user_name}, aun no tienes una cuenta conmigo. ¿Deseas registrarte?"
-        
-        elif self._conversation_state == "confirm_register_for_returning":
-            lower = (text or "").lower()
-
-            positives = [
-                "si",
-                "sí",
-                "claro",
-                "por supuesto",
-                "me encantaria",
-                "me encantaría",
-                "me gustaria",
-                "me gustaría",
-                "me encantaría hacerlo",
-                "dale",
-                "ok",
-            ]
-            negatives = [
-                "no",
-                "ahora no",
-                "no gracias",
-                "prefiero que no",
-                "despues",
-                "después",
-                "tal vez luego",
-                "en otro momento",
-            ]
-
-            def _matches(words: list[str]) -> bool:
-                return any(phrase in lower for phrase in words)
-
-            if _matches(positives):
-                self._conversation_state = "waiting_new_user_name"
-                reply = "Perfecto, ¿como te llamas para crear tu cuenta?"
-            elif _matches(negatives):
-                nombre = self._user_name or "amigo"
-                self._conversation_state = None
-                self._user_name = None
-                reply = f"Esta bien {nombre}, vuelve cuando desees hacerlo."
-            else:
-                self._conversation_state = "waiting_new_user_name"
-                reply = "Para registrarte necesito tu nombre. ¿Como te llamas?"
-
-        elif self._conversation_state == "waiting_new_user_name":
-            lower = (text or "").lower()
-            if self._is_existing_user_utterance(lower):
-                self._conversation_state = "waiting_returning_user_name"
-                self._user_name = None
-                reply = "Entiendo, ya tienes cuenta. ¿Cual es tu nombre para verificar identidad?"
-            else:
-                self._user_name = self._extract_name(text)
-                self._conversation_state = None
-                self._pending_enroll_after_tts = True
-                reply = f"Perfecto, {self._user_name}. Vamos a crearte una cuenta. Mira a la camara cuando te lo indique."
-        
         elif self._conversation_state == "waiting_ocr_more_time":
             lower = (text or "").lower()
             secs = self._extract_seconds(lower)
@@ -1392,16 +1321,26 @@ class Controller:
             logger.debug(f"Identificación abierta: ok={ok}, nombre={recognized_name}, confianza={conf}")
 
             if ok and recognized_name:
+                self._identify_retry_count = 0
                 self._user_name = recognized_name
                 self._mark_authenticated()
                 event_bus.publish("ui:print", role="sys", text=f"[OK] Identidad reconocida: {recognized_name}")
                 self.speak(f"¡Hola de nuevo, {recognized_name}! ¿En qué puedo ayudarte?")
+            elif conf is None and self._identify_retry_count < 2:
+                # No se detecto ningun rostro (no que se detecto uno y no
+                # coincidio): puede que aun no se hubiera acomodado. Reintenta
+                # en vez de asumir que es una persona nueva.
+                self._identify_retry_count += 1
+                self.speak("No hay nadie en la cámara. Por favor, posiciónate bien.")
+                self._pending_identify_after_tts = True
             else:
+                self._identify_retry_count = 0
                 self._conversation_state = "waiting_identify_name"
                 self.speak("No te reconocí. ¿Cómo quieres que te llame?")
         except Exception as e:
             logger.error(f"Error al identificar: {e}", exc_info=True)
             event_bus.publish("ui:print", role="sys", text=f"[ERROR IDENTIFICAR] {e}")
+            self._identify_retry_count = 0
             self._conversation_state = "waiting_identify_name"
             self.speak("Tuve un problema para verificar tu identidad por ahora. ¿Cómo quieres que te llame?")
 
@@ -1500,11 +1439,16 @@ class Controller:
     # ======== NUEVO: OCR (Opción 1) ========
     def _ocr_workflow(self, capture_seconds: float | None = None, llm_mode: bool = False) -> str:
         """
-        Captura durante unos segundos, realiza OCR (Tesseract) y lee en voz alta el texto.
+        Captura durante unos segundos y realiza OCR del documento.
 
-        En `llm_mode` no enuncia el aviso inicial (ya lo dijo el modelo) ni encadena
-        preguntas de seguimiento, y devuelve un resumen del resultado. El texto del
-        documento se lee siempre literal, nunca reformulado.
+        En `llm_mode`, no lee el contenido de una vez: guarda el texto y le
+        pide a Claude que pregunte si la persona quiere un resumen de que
+        trata o el contenido completo (ver entregar_documento, que es quien
+        realmente lo enuncia). El texto del documento se lee siempre literal,
+        nunca reformulado por el modelo salvo que la persona pida el resumen.
+
+        Fuera de `llm_mode` (respaldo sin IA) se mantiene el comportamiento
+        simple de siempre: lee el contenido completo de una vez.
         """
         from app.utils.logger import logger
 
@@ -1520,7 +1464,7 @@ class Controller:
             self.stt.enable_listening(False)
             event_bus.publish("ui:print", role="sys", text="Preparando cámara para capturar documento...")
 
-            capture_seconds = capture_seconds or self._ocr_capture_seconds or 10.0
+            capture_seconds = capture_seconds or self._ocr_capture_seconds or 5.0
             self._ocr_capture_seconds = None
             if not llm_mode:
                 self.speak(f"Muestre el documento frente a la camara. La captura se realizara en {int(capture_seconds)} segundos.")
@@ -1537,20 +1481,26 @@ class Controller:
                 except Exception:
                     pass
 
-                # Limitar TTS si el texto es muy largo
-                MAX_TTS_CHARS = 1200  # Aumentado para documentos más largos
-                spoken = text[:MAX_TTS_CHARS] + (" …" if len(text) > MAX_TTS_CHARS else "")
-
-                event_bus.publish("ui:print", role="sys", text=f"[OK] OCR listo (conf={conf:.1f}%)" if conf else "[OK] OCR listo")
-                event_bus.publish("ui:print", role="app/ocr", text=text)
-
-                # Leer por voz con introducción
                 word_count = len(text.split())
-                self.speak(f"He detectado {word_count} palabras. Leyendo contenido:")
-                self.speak(spoken)
+                # Detalle tecnico solo en terminal, nunca hablado ni en el chat.
+                logger.debug(f"OCR listo: {word_count} palabras, conf={conf}")
+                event_bus.publish("ui:print", role="sys", text=f"[OK] OCR listo (conf={conf:.1f}%)" if conf else "[OK] OCR listo")
 
                 if llm_mode:
-                    return f"Documento leído: {word_count} palabras. Ya se le leyó el texto a la persona."
+                    self._pending_ocr_text = text
+                    return (
+                        f"Documento leído ({word_count} palabras), pero todavía no se le "
+                        "leyó nada a la persona. Pregúntale si quiere que le digas de qué "
+                        "trata (un resumen breve) o que te lo lea completo, palabra por "
+                        "palabra. No leas ni resumas el contenido tú mismo en tu respuesta: "
+                        "cuando la persona responda, usa entregar_documento con el modo que "
+                        "haya elegido."
+                    )
+
+                # Sin modelo: se mantiene el comportamiento simple de siempre.
+                MAX_TTS_CHARS = 1200
+                spoken = text[:MAX_TTS_CHARS] + (" …" if len(text) > MAX_TTS_CHARS else "")
+                self.speak(spoken)
             else:
                 try:
                     if sid is not None:
@@ -1581,8 +1531,9 @@ class Controller:
     # ======== NUEVO: CURRENCY (Opción 2) ========
     def _currency_workflow(self, llm_mode: bool = False) -> str:
         """
-        Detecta el valor de billetes (10, 20, 50, 100, 200 soles) o monedas.
-        Usa OCR en región central del billete para leer el número grande.
+        Detecta el valor de uno o varios billetes/monedas de sol peruano a la
+        vez con Claude Vision (reconoce el diseno completo, no solo un numero
+        impreso). Si hay mas de uno, enuncia cada uno y la suma total.
 
         En `llm_mode` omite el aviso inicial y devuelve un resumen del resultado.
         El valor detectado se enuncia siempre tal cual lo devuelve la detección.
@@ -1603,47 +1554,64 @@ class Controller:
             if not llm_mode:
                 self.speak("Muestre el billete o moneda a la camara. Tendra 15 segundos para posicionar el billete.")
 
-
             # Detectar dinero (15 segundos de captura para mejor posicionamiento)
-            ok, curr, value, conf = detect_currency_best_frame(seconds=15.0)
+            ok, items = detect_currency_best_frame(seconds=15.0)
 
-            if ok and value is not None:
-                # Guardar en BD si está disponible
+            if ok and items:
+                total = sum(valor for _tipo, valor in items)
+
+                def _fmt_unidad(valor: float) -> str:
+                    # Los centimos (menos de 1 sol) se hablan como centimos,
+                    # no como "0.10 soles". "1" es singular: "1 sol", no "1 soles".
+                    if valor < 1:
+                        centimos = round(valor * 100)
+                        return "1 céntimo" if centimos == 1 else f"{centimos} céntimos"
+                    if abs(valor - 1) < 1e-6:
+                        return "1 sol"
+                    return f"{int(valor)} soles" if abs(valor - int(valor)) < 1e-6 else f"{valor:.2f} soles"
+
+                def _fmt_total(valor: float) -> str:
+                    soles = int(valor)
+                    centimos = round((valor - soles) * 100)
+                    soles_str = "1 sol" if soles == 1 else f"{soles} soles"
+                    centimos_str = "1 céntimo" if centimos == 1 else f"{centimos} céntimos"
+                    if soles and centimos:
+                        return f"{soles_str} con {centimos_str}"
+                    if soles:
+                        return soles_str
+                    return centimos_str
+
+                descripciones = [f"{tipo} de {_fmt_unidad(valor)}" for tipo, valor in items]
+                if len(descripciones) == 1:
+                    resumen = f"Detecté {descripciones[0]}."
+                else:
+                    resumen = (
+                        f"Detecté {', '.join(descripciones[:-1])} y {descripciones[-1]}. "
+                        f"En total son {_fmt_total(total)}."
+                    )
+
+                # Guardar en BD si está disponible: una fila por cada item.
                 try:
                     if sid is not None:
-                        dao.insert_currency_detection(sid, currency=curr or "PEN", value=float(value), confidence=conf)
-                        dao.finish_session(sid, ok=True, details=f"{curr} {value}, conf={conf}")
+                        for _tipo, valor in items:
+                            dao.insert_currency_detection(sid, currency="PEN", value=float(valor), confidence=92.0)
+                        dao.finish_session(sid, ok=True, details=f"{len(items)} item(s), total={total}")
                 except Exception:
                     pass
 
-                # Formatear valor para TTS y UI usando la divisa detectada.
-                # curr puede ser None si no se identifico la divisa; en ese caso
-                # se habla de "unidades" y si es una divisa desconocida se usa su
-                # propio codigo.
-                moneda_natural = _CURR_TO_UNIT.get(curr, curr) if curr else "unidades"
+                self.speak(resumen)
 
-                es_entero = abs(value - int(value)) < 1e-6
-                value_str = str(int(value)) if es_entero else f"{value:.2f}"
-
-                # Determinar si es billete o moneda (heurística simple)
-                tipo = "un billete de" if value >= 10 else "una moneda de"
-
-                # Responder por voz usando la moneda detectada
-                self.speak(f"Detecté {tipo} {value_str} {moneda_natural}.")
-
-                conf_str = f" (conf={conf:.1f}%)" if conf is not None else ""
-                event_bus.publish("ui:print", role="sys", text=f"[OK] Detectado: {curr} {value_str}{conf_str}")
-                event_bus.publish("ui:print", role="app/currency", text=f"Valor: {value_str} {moneda_natural}")
+                event_bus.publish("ui:print", role="sys", text=f"[OK] {resumen}")
 
                 if llm_mode:
-                    return f"Detectado: {value_str} {moneda_natural}. Ya se le comunicó a la persona."
+                    return f"{resumen} Ya se le comunicó a la persona (incluido el total si había más de uno)."
             else:
                 try:
                     if sid is not None:
-                        dao.finish_session(sid, ok=False, details=f"conf={conf}")
+                        dao.finish_session(sid, ok=False, details="sin detecciones")
                 except Exception:
                     pass
-                
+
                 event_bus.publish("ui:print", role="sys", text="[FALLO] No pude detectar el valor del dinero")
                 if llm_mode:
                     return "No se pudo determinar el valor. Conviene más luz o acercar el billete."
@@ -1722,8 +1690,6 @@ class Controller:
                 if conf is not None:
                     detalle += f" (conf={conf:.1f}%)"
                 event_bus.publish("ui:print", role="sys", text=detalle)
-                
-                event_bus.publish("ui:print", role="app/expiry", text=f"Fecha: {date_text} - Estado: {'VENCIDO' if is_expired else 'VIGENTE'}")
 
                 if llm_mode:
                     estado = "vencido" if is_expired else "vigente"
@@ -1737,10 +1703,13 @@ class Controller:
                 
                 event_bus.publish("ui:print", role="sys", text="[FALLO] No pude leer la fecha de vencimiento")
                 if llm_mode:
-                    return "No se pudo leer la fecha de vencimiento con claridad."
+                    return (
+                        "No se encontró ninguna fecha de vencimiento en la foto. Avísale y "
+                        "pídele que muestre el empaque desde otro ángulo, con buena luz."
+                    )
                 self._conversation_state = "waiting_expiry_more_time"
                 self._expiry_capture_seconds = None
-                self.speak("No pude leer la fecha de vencimiento con claridad. ¿Deseas más tiempo?")
+                self.speak("No encontré una fecha de vencimiento en la foto. Muestra el empaque desde otro ángulo. ¿Necesitas más tiempo?")
 
         except Exception as e:
             logger.error(f"Error en expiry workflow: {e}", exc_info=True)
@@ -1778,7 +1747,6 @@ class Controller:
 
             if ok and description:
                 self.speak(description)
-                event_bus.publish("ui:print", role="app/scene", text=description)
                 if llm_mode:
                     return "Ya se le describió el entorno a la persona con el resultado literal."
             else:

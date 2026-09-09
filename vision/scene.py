@@ -75,6 +75,10 @@ def _claude_vision_scene(frame) -> Optional[str]:
     return text or None
 
 
+def _should_show_debug_preview() -> bool:
+    return bool(getattr(vision, "show_preview", False))
+
+
 def describe_scene_best_frame(seconds: float = 5.0) -> Tuple[bool, Optional[str]]:
     """
     Abre la camara, deja que se estabilice el enfoque y describe lo que ve.
@@ -88,7 +92,7 @@ def describe_scene_best_frame(seconds: float = 5.0) -> Tuple[bool, Optional[str]
     t0 = time.time()
     for current in frames_for(seconds):
         frame = current
-        if getattr(vision, "show_preview", False):
+        if _should_show_debug_preview():
             show = frame.copy()
             time_left = int(seconds - (time.time() - t0)) + 1
             cv2.putText(
@@ -104,7 +108,7 @@ def describe_scene_best_frame(seconds: float = 5.0) -> Tuple[bool, Optional[str]
             cv2.imshow("Descripcion de escena", show)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
-    if getattr(vision, "show_preview", False):
+    if _should_show_debug_preview():
         cv2.destroyAllWindows()
 
     if frame is None:

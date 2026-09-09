@@ -13,7 +13,7 @@ from typing import Optional, Tuple, List
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from app.config.settings import configure_tesseract, vision
+from app.config.settings import configure_tesseract, llm as llm_config, vision
 from app.vision.camera_service import frames_for
 
 # Configurar Tesseract. La ruta esta centralizada en config.settings y se puede
@@ -196,6 +196,124 @@ def _google_vision_ocr(frame: np.ndarray, lang: str) -> Tuple[str, float]:
     if not text:
         return "", 0.0
     return text, 95.0
+
+
+def _claude_vision_ocr_document(frame: np.ndarray) -> Tuple[str, float]:
+    """
+    OCR con Claude Vision: segundo respaldo si Google Cloud Vision no esta
+    configurado o fallo, antes de caer a Tesseract. Suele leer mejor que
+    Tesseract fotos reales (torcidas, con poca luz, letra manuscrita), igual
+    que ya se usa para dinero, vencimiento y descripcion de escena.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return "", 0.0
+
+    from app.utils.logger import logger
+
+    try:
+        import anthropic
+    except ImportError:
+        return "", 0.0
+
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ok:
+        return "", 0.0
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=llm_config.model,
+            max_tokens=2048,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": base64.b64encode(buffer.tobytes()).decode("ascii"),
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "Transcribe todo el texto visible en esta imagen de un "
+                                "documento, tal cual aparece, sin resumir ni comentar nada. "
+                                "Responde UNICAMENTE con el texto transcrito, nada mas: sin "
+                                "introducciones, sin explicar la calidad de la imagen, sin "
+                                "disculpas. Si el texto esta al reves, espejado, borroso, mal "
+                                "iluminado o por cualquier motivo no puedes leerlo con certeza "
+                                "(aunque distingas que hay texto), no lo intentes describir ni "
+                                "expliques por que: responde unicamente con la palabra NINGUNO."
+                            ),
+                        },
+                    ],
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(f"Claude Vision OCR fallo, se usa Tesseract: {exc}")
+        return "", 0.0
+
+    raw = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    if not raw or raw.upper() == "NINGUNO":
+        return "", 0.0
+
+    text = _sanitize_text(raw)
+    if not text:
+        return "", 0.0
+    return text, 90.0
+
+
+def summarize_document_text(text: str) -> str:
+    """
+    Pide a Claude un resumen breve de que trata el documento (tres a cinco
+    frases), en vez de leerlo palabra por palabra. Se llama solo cuando la
+    persona pide explicitamente el resumen (ver Controller.entregar_documento);
+    ya no se dispara sola por longitud.
+    """
+    if not text or not text.strip():
+        return text
+
+    # Un texto muy corto (una etiqueta, una linea) no tiene mucho que resumir.
+    if len(text.split()) < 15:
+        return text
+
+    from app.utils.logger import logger
+
+    try:
+        import anthropic
+    except ImportError:
+        return text
+
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Este es el texto completo extraido por OCR de un documento. "
+                        "Dale a una persona con discapacidad visual un resumen breve y "
+                        "claro de que trata, en tres a cinco frases: que tipo de documento "
+                        "es y su contenido mas relevante. No lo transcribas palabra por "
+                        "palabra ni cites fragmentos largos textuales, da contexto general. "
+                        "Responde unicamente con el resumen, sin comentarios ni encabezados.\n\n"
+                        f"Texto:\n{text}"
+                    ),
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.warning(f"Resumen de documento con Claude fallo, se lee el texto completo: {exc}")
+        return text
+
+    summary = "".join(b.text for b in response.content if getattr(b, "type", None) == "text").strip()
+    return summary or text
 
 
 def _clean_ocr_text_with_claude(raw_text: str) -> str:
@@ -390,6 +508,10 @@ def _quick_simple_ocr(gray: np.ndarray, lang: str) -> tuple[str, float]:
     return best_text, best_conf
 
 
+def _should_show_debug_preview() -> bool:
+    return bool(vision.show_preview)
+
+
 def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool, Optional[str], Optional[float]]:
     """
     Muestra preview de la cámara, elige el frame más nítido y procesa OCR.
@@ -409,8 +531,8 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
-        # Dar tiempo para que el usuario posicione el documento (8s minimo para agilizar)
-        preview_time = max(seconds, 8.0)
+        # Dar tiempo para que el usuario posicione el documento.
+        preview_time = max(seconds, 5.0)
         t0 = time.time()
 
         print("?? Posicione el documento frente a la camara...")
@@ -426,7 +548,7 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
                 best_brightness = brightness
                 best_contrast = contrast
 
-            if vision.show_preview:
+            if _should_show_debug_preview():
                 display = frame.copy()
                 time_left = int(preview_time - (time.time() - t0)) + 1
 
@@ -467,7 +589,7 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
             print(f"?? Usando frame con nitidez={best_focus:.1f}, brillo={best_brightness:.1f}, contraste={best_contrast:.1f}")
 
         # Mostrar la foto capturada por un instante
-        if vision.show_preview and captured_frame is not None:
+        if _should_show_debug_preview() and captured_frame is not None:
             display = captured_frame.copy()
             cv2.putText(display, "FOTO CAPTURADA - Procesando...", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
@@ -491,8 +613,9 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
 
     best_candidate = None
 
-    # Si hay GOOGLE_VISION_API_KEY configurada, probar primero: suele leer
-    # mejor fotos reales (torcidas, con sombra) que Tesseract.
+    # Orden de mejor a peor lectura de fotos reales, para evitar devolver
+    # texto que no se entiende: 1) Google Cloud Vision, si esta configurado.
+    # 2) Claude Vision, como respaldo. 3) Tesseract local, ultimo recurso.
     google_text, google_conf = _google_vision_ocr(captured_frame, lang)
     if google_text:
         best_candidate = {
@@ -504,7 +627,19 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
             "gray": gray_base,
         }
 
-    angles = [] if best_candidate else [0]  # saltar Tesseract si Google ya funciono
+    if not best_candidate:
+        claude_text, claude_conf = _claude_vision_ocr_document(captured_frame)
+        if claude_text:
+            best_candidate = {
+                "text": claude_text,
+                "conf": claude_conf,
+                "label": "claude-vision",
+                "angle": 0,
+                "processed": {"enhanced": gray_base, "binary": gray_base, "binary_inv": gray_base},
+                "gray": gray_base,
+            }
+
+    angles = [] if best_candidate else [0]  # saltar Tesseract si ya hay resultado
 
     for angle in angles:
         rotated_gray = _rotate_image(gray_base, angle)
@@ -607,7 +742,7 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
         cv2.imwrite(str(otsu_inv_path), selected_processed["otsu_inv"])
     print(f"V OCR listo ({word_count} palabras, conf={conf:.1f}%). Imagen procesada: {binary_path}")
 
-    if vision.show_preview:
+    if _should_show_debug_preview():
         cv2.imshow("OCR - Imagen mejorada", selected_processed["enhanced"])
         cv2.imshow("OCR - Imagen binaria", selected_processed["binary"])
         cv2.imshow("OCR - Imagen binaria invertida", selected_processed["binary_inv"])
@@ -632,40 +767,11 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     # archivo de resultado de arriba ya guardo el texto crudo para depurar.
     text = _clean_ocr_text_with_claude(text)
 
+    # El resumen ya no se hace aqui de forma automatica: se le pregunta a la
+    # persona si quiere un resumen o el contenido completo (ver
+    # Controller._ocr_workflow / entregar_documento), asi que esta funcion
+    # siempre devuelve el texto completo tal cual se leyo.
+
     # Considerar exitoso si hay texto, aunque la confianza sea baja (para no devolver vacío)
     ok = bool(text)
     return ok, text, conf
-
-
-def leer_texto_desde_camara():
-    """Activa la cámara, lee texto en tiempo real y lo muestra en consola."""
-    cam = cv2.VideoCapture(0)
-    if not cam.isOpened():
-        print("[ERROR] No se pudo abrir la cámara.")
-        return
-
-    print("Camara encendida. Presiona 'q' para salir.")
-
-    while True:
-        ret, frame = cam.read()
-        if not ret:
-            print("Error al capturar frame.")
-            break
-
-        # Conversión a escala de grises y mejora de contraste
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        text = pytesseract.image_to_string(gray, lang='spa')
-
-        # Mostrar en consola
-        if text.strip():
-            print("\nTexto detectado:")
-            print(text.strip())
-
-        # Mostrar vista previa
-        cv2.imshow('Vista en tiempo real (OCR)', frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cam.release()
-    cv2.destroyAllWindows()

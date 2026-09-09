@@ -17,8 +17,19 @@ class TTSConfig:
     rate: int = 180
     volume: float = 1.0
     edge_voice: str = "es-MX-DaliaNeural"
-    elevenlabs_model: str = "eleven_flash_v2_5"
+    # eleven_flash_v2_5 prioriza latencia baja a costa de naturalidad: acorta
+    # las pausas de puntuacion y suena apurado. eleven_multilingual_v2 tarda
+    # un poco mas en generarse pero respeta comas y puntos, con una entonacion
+    # mucho mas fluida.
+    elevenlabs_model: str = "eleven_multilingual_v2"
     elevenlabs_timeout_seconds: float = 15.0
+    # Ajustes de la voz: velocidad por debajo de 1.0 para un ritmo mas calmado,
+    # y stability/similarity moderados para que suene expresiva sin volverse
+    # inestable entre frases.
+    elevenlabs_stability: float = 0.5
+    elevenlabs_similarity_boost: float = 0.75
+    elevenlabs_style: float = 0.35
+    elevenlabs_speed: float = 0.92
 
 
 def _env_float(name: str, default: float) -> float:
@@ -208,10 +219,18 @@ class VisionConfig:
 
     # Dispositivo de camara y enrolamiento
     camera_index: int = 0
+    # Si se define, se busca una camara cuyo nombre contenga este texto y se
+    # usa su indice en vez de camera_index (mas confiable que un numero fijo,
+    # que puede cambiar segun que otras camaras/apps virtuales esten activas).
+    camera_name_hint: Optional[str] = None
     # Gira el video si la camara entrega horizontal aunque se sostenga en
     # vertical (comun con el celular como webcam via apps tipo iVCam).
     # Valores: 0, 90, 180 o 270.
     camera_rotate_degrees: int = 0
+    # Corrige el efecto espejo si la camara entrega el video reflejado
+    # horizontalmente (comun en apps tipo iVCam en modo "selfie"): el texto
+    # de un documento se veria al reves. Activar con OJOZ_CAMERA_FLIP=1.
+    camera_flip_horizontal: bool = False
     capture_count: int = 20
     min_enrollment_photos: int = 10
     capture_frame_width: int = 960
@@ -292,7 +311,13 @@ vision = VisionConfig(
     model_file=_MODEL_FILE,
     insightface_root=_INSIGHTFACE_ROOT,
     camera_index=_env_int("OJOZ_CAMERA_INDEX", 0),
+    # Por defecto usa el celular como camara via iVCam: se puede acercar a un
+    # documento o billete, algo que una webcam fija del laptop (apuntando a
+    # la cara) no permite bien. Vacio ("") vuelve a depender solo de
+    # OJOZ_CAMERA_INDEX; cambiar a "UVC WebCam" para forzar la webcam fisica.
+    camera_name_hint=os.environ.get("OJOZ_CAMERA_NAME", "iVCam").strip() or None,
     camera_rotate_degrees=_env_int("OJOZ_CAMERA_ROTATE", 0),
+    camera_flip_horizontal=_env_bool("OJOZ_CAMERA_FLIP", False),
     capture_count=20,
     min_enrollment_photos=10,
     capture_frame_width=960,
@@ -301,3 +326,13 @@ vision = VisionConfig(
     face_similarity_threshold=_env_float("OJOZ_FACE_THRESHOLD", 0.50),
     show_preview=_env_bool("OJOZ_SHOW_PREVIEW", True),
 )
+
+if vision.camera_name_hint:
+    try:
+        from app.vision.camera import find_camera_index_by_name
+
+        _resolved = find_camera_index_by_name(vision.camera_name_hint)
+        if _resolved is not None:
+            vision.camera_index = _resolved
+    except Exception:
+        pass  # Se sigue usando camera_index tal cual si la busqueda falla.

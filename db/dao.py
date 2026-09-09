@@ -35,12 +35,6 @@ def get_all_users() -> list[dict]:
         cur = conn.execute("SELECT * FROM users ORDER BY created_at DESC")
         return [dict(row) for row in cur.fetchall()]
 
-def user_exists(name: str) -> bool:
-    """Verifica si un usuario ya está registrado."""
-    with get_conn() as conn:
-        cur = conn.execute("SELECT 1 FROM users WHERE name = ? LIMIT 1", (name,))
-        return cur.fetchone() is not None
-
 # ---------- Photos ----------
 def insert_face_photos(
     user_id: int,

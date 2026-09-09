@@ -45,3 +45,15 @@ colorama==0.4.6
 # un evento aparte que Flet no expone), asi que la deteccion de "soltar" se
 # hace a nivel de sistema operativo con esta libreria.
 pynput==1.8.2
+
+# --- Seleccion de camara por nombre ---
+# Permite elegir la webcam fisica del laptop por nombre (p. ej. "UVC WebCam")
+# en vez de un indice de DirectShow fijo, que cambia segun que otras camaras
+# virtuales (iVCam, OBS, NVIDIA Broadcast) esten activas en ese momento.
+pygrabber==0.2
+
+# --- Variables de entorno desde archivo ---
+# Carga las claves de API (ELEVENLABS_*, ANTHROPIC_API_KEY, GOOGLE_VISION_API_KEY,
+# OJOZ_*) desde un archivo .env junto a main.py/main_flet.py, en vez de tener
+# que escribirlas a mano en cada terminal nueva. Ver .env.example.
+python-dotenv==1.2.3
