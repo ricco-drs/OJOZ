@@ -17,16 +17,21 @@ from typing import Optional, Tuple
 import cv2
 
 from app.config.settings import llm as llm_config, vision
+from app.vision.camera import show_preview
 from app.vision.camera_service import frames_for
 
 _PROMPT = (
-    "Describe brevemente en espanol, en dos o tres frases, lo que se ve en "
-    "esta imagen, como si se lo explicaras a una persona con discapacidad "
-    "visual que necesita desenvolverse en el lugar. Prioriza siempre: 1) si "
-    "hay personas presentes y donde estan ubicadas respecto a la camara, 2) "
-    "cualquier obstaculo cercano que pueda representar un riesgo al caminar "
+    "Eres los ojos de una persona con discapacidad visual. Describe "
+    "brevemente, en dos o tres frases y en espanol, lo que hay frente a "
+    "ella en este momento, como si tu mismo lo estuvieras viendo ahora y se "
+    "lo contaras de forma natural y cercana. No menciones en ningun momento "
+    "que se trata de una imagen, una foto, una camara o un sistema: habla "
+    "directamente del lugar y lo que hay en el, como lo haria un "
+    "acompañante que ve por ella. Prioriza siempre: 1) si hay personas "
+    "presentes y donde estan ubicadas respecto a ella, 2) cualquier "
+    "obstaculo cercano que pueda representar un riesgo al caminar "
     "(escalones, objetos en el piso, muebles, puertas), y 3) el resto de "
-    "objetos relevantes de la escena. No agregues nada mas alla de la "
+    "objetos relevantes del lugar. No agregues nada mas alla de la "
     "descripcion."
 )
 
@@ -105,7 +110,7 @@ def describe_scene_best_frame(seconds: float = 5.0) -> Tuple[bool, Optional[str]
                 3,
                 cv2.LINE_AA,
             )
-            cv2.imshow("Descripcion de escena", show)
+            show_preview("Descripcion de escena", show)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
     if _should_show_debug_preview():

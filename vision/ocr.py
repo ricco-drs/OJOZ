@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from app.config.settings import configure_tesseract, llm as llm_config, vision
+from app.vision.camera import show_preview
 from app.vision.camera_service import frames_for
 
 # Configurar Tesseract. La ruta esta centralizada en config.settings y se puede
@@ -574,7 +575,7 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
 
                 cv2.putText(display, text, (x, y), font, font_scale, (0, 255, 0), thickness)
 
-                cv2.imshow("OCR - Preparando captura", display)
+                show_preview("OCR - Preparando captura", display)
                 if cv2.waitKey(1) & 0xFF == 27:
                     return False, None, None
 
@@ -593,7 +594,7 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
             display = captured_frame.copy()
             cv2.putText(display, "FOTO CAPTURADA - Procesando...", (50, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3)
-            cv2.imshow("OCR - Foto capturada", display)
+            show_preview("OCR - Foto capturada", display)
             cv2.waitKey(800)
 
     finally:
@@ -743,11 +744,11 @@ def read_text_best_frame(seconds: float = 10.0, lang: str = 'spa') -> Tuple[bool
     print(f"V OCR listo ({word_count} palabras, conf={conf:.1f}%). Imagen procesada: {binary_path}")
 
     if _should_show_debug_preview():
-        cv2.imshow("OCR - Imagen mejorada", selected_processed["enhanced"])
-        cv2.imshow("OCR - Imagen binaria", selected_processed["binary"])
-        cv2.imshow("OCR - Imagen binaria invertida", selected_processed["binary_inv"])
+        show_preview("OCR - Imagen mejorada", selected_processed["enhanced"])
+        show_preview("OCR - Imagen binaria", selected_processed["binary"])
+        show_preview("OCR - Imagen binaria invertida", selected_processed["binary_inv"])
         if "otsu" in selected_processed:
-            cv2.imshow("OCR - Imagen otsu", selected_processed["otsu"])
+            show_preview("OCR - Imagen otsu", selected_processed["otsu"])
         cv2.waitKey(1500)
 
     result_path = vision.ocr_dir / f"resultado_{timestamp}.txt"

@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from app.config.settings import llm as llm_config, vision
+from app.vision.camera import show_preview
 from app.vision.camera_service import frames_for
 
 # Denominaciones reales del sol peruano (PEN).
@@ -152,7 +153,7 @@ def detect_currency_best_frame(seconds: float = 8.0) -> Tuple[bool, List[Currenc
                 3,
                 cv2.LINE_AA,
             )
-            cv2.imshow("Deteccion de Dinero", show)
+            show_preview("Deteccion de Dinero", show)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
     if _should_show_debug_preview():

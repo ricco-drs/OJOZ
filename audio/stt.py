@@ -196,16 +196,33 @@ class STT:
         return fallback
 
     def _available_inputs(self) -> list[dict]:
+        """
+        Entradas de audio disponibles, con la preferida por OJOZ_MIC_NAME
+        primero si hay alguna coincidencia.
+
+        Antes esto filtraba y dejaba solo los dispositivos que coincidian con
+        el nombre (p. ej. "iVCam"), asi que si ese microfono sonaba mal no
+        habia forma de usar otro: ni el respaldo automatico ante fallo, ni el
+        panel de ajustes (set_device_index) podian ofrecer el microfono de la
+        laptop, porque quedaba excluido de la lista antes de llegar a ese
+        codigo. Ahora es solo un orden de preferencia: si el hint no
+        coincide con nada, o si el usuario elige otro dispositivo a mano, el
+        resto de microfonos siguen disponibles como candidatos.
+        """
         devices = input_devices()
-        if self._device_name_hint:
-            devices = [d for d in devices if self._device_name_hint in d["name"].casefold()]
-        return devices
+        if not self._device_name_hint:
+            return devices
+        hinted = [d for d in devices if self._device_name_hint in d["name"].casefold()]
+        if not hinted:
+            return devices
+        others = [d for d in devices if d not in hinted]
+        return hinted + others
 
     def _microphone_candidates(self) -> list[int]:
         devices = self._available_inputs()
         indices = [d["index"] for d in devices]
-        if not indices and self._device_name_hint:
-            raise OSError(f"No hay una entrada conectada con el nombre '{self._device_name_hint}'")
+        if not indices:
+            raise OSError("No hay ninguna entrada de audio conectada")
         if self._strict_device_lock and self._configured_device_index is not None:
             return [self._configured_device_index]
         if self._device_index in indices:
@@ -708,8 +725,14 @@ class STT:
         Se convierte a 16 kHz mono, que es el formato con el que se entrenó el
         modelo y el que prefiere el reconocedor. Ante cualquier problema se
         devuelve el audio recibido sin modificar.
+
+        Si ElevenLabs va a transcribir, se omite: su propio modelo ya filtra
+        el ruido de fondo, y limpiarlo dos veces no aporta nada. Solo se
+        aplica quedando como respaldo cuando el motor activo es Google STT.
         """
         if not stt_config.denoise_enabled:
+            return audio
+        if self._elevenlabs_stt_available():
             return audio
         try:
             raw16 = audio.get_raw_data(convert_rate=TARGET_SAMPLE_RATE, convert_width=2)
@@ -807,7 +830,27 @@ class STT:
         except URLError as exc:
             raise RuntimeError("No se pudo conectar con ElevenLabs") from exc
 
-        return (result.get("text") or "").strip(), None
+        text = (result.get("text") or "").strip()
+        return self._strip_nonspeech_tags(text), None
+
+    @staticmethod
+    def _strip_nonspeech_tags(text: str) -> str:
+        """
+        Quita anotaciones de sonido no verbal que ElevenLabs Scribe a veces
+        devuelve como si fueran texto (p. ej. "[pause]", "[laughter]",
+        "(background noise)") cuando no hay voz real que transcribir.
+
+        Sin esto, esas etiquetas se publicaban como si la persona las hubiera
+        dicho, y el asistente respondia a un "[pause]" como si fuera texto real.
+        """
+        if not text:
+            return text
+        cleaned = re.sub(r"[\[(][^\])]*[\])]", "", text)
+        return cleaned.strip()
+
+    def _elevenlabs_stt_available(self) -> bool:
+        """True si ElevenLabs Scribe es el motor que se va a usar ahora mismo."""
+        return bool(os.environ.get("ELEVENLABS_API_KEY", "").strip()) and not self._elevenlabs_stt_disabled
 
     def _recognize(self, audio: sr.AudioData) -> tuple[str, float | None]:
         """
@@ -818,8 +861,7 @@ class STT:
         desactiva por el resto de la sesion (no tiene sentido reintentar en
         cada frase) y se sigue con Google sin interrumpir el servicio.
         """
-        elevenlabs_key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
-        if elevenlabs_key and not self._elevenlabs_stt_disabled:
+        if self._elevenlabs_stt_available():
             try:
                 text, _ = self._recognize_with_elevenlabs(audio)
                 self._recognition_failed = False

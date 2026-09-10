@@ -13,6 +13,7 @@ import numpy as np
 import pytesseract
 
 from app.config.settings import configure_tesseract, llm as llm_config, vision
+from app.vision.camera import show_preview
 from app.vision.camera_service import frames_for
 
 configure_tesseract()
@@ -313,7 +314,7 @@ def check_expiry_best_frame(seconds: float = 6.0) -> Tuple[bool, Optional[str], 
                 3,
                 cv2.LINE_AA,
             )
-            cv2.imshow("Verificacion de Vencimiento", show)
+            show_preview("Verificacion de Vencimiento", show)
             if cv2.waitKey(1) & 0xFF == 27:
                 break
     if _should_show_debug_preview():

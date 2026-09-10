@@ -69,12 +69,17 @@ class STTTests(unittest.TestCase):
         with patch.object(self.stt, "_probe_microphone_rms", side_effect=[0, 80]):
             self.assertEqual(self.stt._auto_select_microphone(), 6)
 
-    def test_name_constraint_applies_to_fallback(self):
-        self.stt._device_name_hint = "realtek"
-        self.assertEqual(self.stt._microphone_candidates(), [1, 6])
+    def test_name_hint_prioritizes_without_excluding_other_mics(self):
+        # El hint (OJOZ_MIC_NAME) es una preferencia de orden, no un filtro
+        # exclusivo: si el dispositivo preferido no sirve (o el hint no
+        # coincide con nada), los demas microfonos -como el de la laptop-
+        # siguen disponibles como candidatos en vez de desaparecer.
+        self.stt._device_index = None
+        self.stt._device_name_hint = "ivcam"
+        self.assertEqual(self.stt._microphone_candidates(), [7, 1, 6])
+
         self.stt._device_name_hint = "missing"
-        with self.assertRaisesRegex(OSError, "missing"):
-            self.stt._microphone_candidates()
+        self.assertEqual(self.stt._microphone_candidates(), [1, 6, 7])
 
     def test_obsolete_output_index_falls_back_to_real_inputs(self):
         self.stt._device_index = self.stt._configured_device_index = 8

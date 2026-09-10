@@ -154,7 +154,11 @@ class Controller:
             intentos_sin_rostro = 0
             while True:
                 try:
-                    ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
+                    ok, recognized_name, conf = recognize_best_frame(
+                        seconds=5.0,
+                        expected_name=None,
+                        on_feedback=self.speak,
+                    )
                 except FileNotFoundError:
                     ok, recognized_name, conf = False, None, None
 
@@ -1313,7 +1317,11 @@ class Controller:
             event_bus.publish("ui:print", role="sys", text="Verificando identidad...")
 
             try:
-                ok, recognized_name, conf = recognize_best_frame(seconds=5.0, expected_name=None)
+                ok, recognized_name, conf = recognize_best_frame(
+                    seconds=5.0,
+                    expected_name=None,
+                    on_feedback=self.speak,
+                )
             except FileNotFoundError:
                 ok, recognized_name, conf = False, None, None
 
@@ -1368,6 +1376,7 @@ class Controller:
             ok, recognized_name, conf = recognize_best_frame(
                 seconds=5.0,
                 expected_name=self._user_name,
+                on_feedback=self.speak,
             )
 
             event_bus.publish("camera.closed", index=vision.camera_index)

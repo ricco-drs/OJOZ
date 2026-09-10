@@ -11,7 +11,10 @@ import imutils
 
 from app.config.settings import vision
 from app.utils.fs import ensure_user_folder
-from app.vision.camera import open_camera, read_frame, release
+# `show_preview` es tambien el nombre del parametro booleano de capture_faces,
+# asi que la funcion de la camara se importa con otro nombre para no taparla.
+from app.vision.camera import FrameGrabber
+from app.vision.camera import show_preview as show_preview_window
 from app.vision.face_engine import DetectedFace, get_face_engine
 
 
@@ -82,14 +85,18 @@ def capture_faces(
 
     engine = get_face_engine()
     engine.warm_up()
-    cap = open_camera(vision.camera_index)
     saved = 0
     last_saved_at = 0.0
     started_at = time.monotonic()
 
-    try:
+    # La camara se lee en su propio hilo: asi la vista previa no queda atada
+    # al ritmo del detector ni muestra fotogramas viejos encolados.
+    with FrameGrabber(vision.camera_index) as grabber:
         while saved < count and time.monotonic() - started_at < vision.capture_timeout_seconds:
-            frame = imutils.resize(read_frame(cap), width=vision.capture_frame_width)
+            latest = grabber.latest()
+            if latest is None:
+                break
+            frame = imutils.resize(latest, width=vision.capture_frame_width)
             faces = engine.detect(frame, max_faces=2)
             status = "Coloque un solo rostro frente a la camara"
             selected = faces[0] if len(faces) == 1 else None
@@ -121,11 +128,9 @@ def capture_faces(
                     (0, 255, 0),
                     2,
                 )
-                cv2.imshow("OJOZ - enrolamiento ArcFace", frame)
+                show_preview_window("OJOZ - enrolamiento ArcFace", frame)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
-    finally:
-        release(cap)
 
     try:
         if saved >= vision.min_enrollment_photos:
