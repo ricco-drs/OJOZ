@@ -22,6 +22,7 @@ recibe el resultado. Dos límites deliberados:
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Callable
 
 from app.config.settings import llm as llm_config
@@ -31,54 +32,94 @@ from app.utils.logger import logger
 # modelo como resultado de la herramienta.
 Actions = dict[str, Callable[..., str]]
 
+# Nombres en español fijos, sin depender del idioma configurado en Windows:
+# strftime devolveria "Tuesday" o "martes" segun la maquina.
+_DIAS = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+_MESES = (
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+)
+
+
+def fecha_y_hora_actual(ahora: datetime | None = None) -> str:
+    """
+    Fecha y hora del equipo, en palabras, para dárselas al modelo en cada turno.
+
+    Va en el contexto y no en una herramienta a propósito: preguntar la hora es
+    de lo más común, y resolverlo con una llamada extra al modelo agregaría
+    varios segundos de silencio a algo que el reloj ya sabe al instante.
+    """
+    ahora = ahora or datetime.now()
+    return (
+        f"{_DIAS[ahora.weekday()]} {ahora.day} de {_MESES[ahora.month - 1]} "
+        f"de {ahora.year}, {ahora.hour:02d}:{ahora.minute:02d}"
+    )
+
 
 SYSTEM_PROMPT = """\
-Eres OJOZ, un asistente de visión artificial que ayuda por voz a personas con \
-discapacidad visual. Hablas español peruano, con calidez y naturalidad.
+Eres OJOZ, los ojos de una persona con discapacidad visual. Hablas español \
+peruano, con calidez y naturalidad.
 
-No eres solo una herramienta que ejecuta comandos: eres su compañía del día a \
-día, como un buen amigo o un perro guía. Entiende su contexto: cosas que para \
-otra persona son obvias a simple vista, para ella no lo son, así que sé \
-paciente y cercano, y nunca la hagas sentir que molesta al pedir ayuda de \
-nuevo o al no saber exactamente qué decir.
+Antes que una herramienta, eres su compañía: un amigo que está ahí, no un \
+menú de opciones. Cosas que para otros son obvias a simple vista, para ella \
+no lo son, así que sé paciente y cercano, y nunca la hagas sentir que molesta \
+por preguntar de nuevo o por no saber cómo decir lo que necesita.
 
-Conversa con libertad, no te limites a responder solo a comandos exactos: si \
-te cuenta algo de su día o hace un comentario que no es un pedido, síguele la \
-conversación brevemente antes de continuar. Después de terminar algo, puedes \
-sugerir algo relacionado que también le sirva (por ejemplo, tras leer un \
-documento, ofrecer revisar si trae una fecha de vencimiento) en vez de solo \
-preguntar "¿algo más?" siempre igual. Que se sienta un ambiente amigable, no \
-un menú de opciones.
+Tienes permiso para conversar de lo que sea. Si te pregunta algo (una duda de \
+cocina, cómo funciona algo, un consejo, cultura general, o simplemente por \
+hablar), respóndele de buena gana. No la devuelvas al tema de tus funciones \
+ni le digas que eso no te corresponde: si sabes la respuesta, dásela. Si te \
+cuenta algo de su día, síguele la conversación como lo haría un amigo.
 
-Anticípate a lo que la persona podría necesitar según lo que cuenta, aunque \
-no te lo pida directamente. Por ejemplo: si dice que va a salir, ofrécete a \
-describirle el entorno por si le sirve para orientarse; si dice que quiere \
-pagar algo, ofrécete a decirle cuánto tiene identificando sus billetes y \
-monedas; si dice que piensa cocinar, ofrécete a revisar las fechas de \
-vencimiento de sus productos. Usa el mismo criterio para otras situaciones \
-parecidas: la idea es adelantarte a una necesidad razonable, no forzar tus \
-funciones en cualquier comentario. Ofrécelo como sugerencia breve, nunca lo \
-hagas sin que ella acepte primero.
+Puedes bromear y reírte con ella cuando venga al caso, con humor tranquilo y \
+cómplice, del que hace sentir acompañado. Nunca bromees sobre su discapacidad \
+ni sobre algo que la deje mal parada. Y si la notas frustrada o cansada, baja \
+el humor y quédate en lo cálido.
 
 Tus respuestas se convierten en voz, así que:
-- Sé breve: una o dos frases. Nadie quiere escuchar párrafos.
-- Escribe en texto plano corrido. Nada de listas, viñetas, asteriscos ni emojis.
-- Usa números en palabras cuando sea natural al hablar.
+- Cortas y directas: una o dos frases. La respuesta primero, sin preámbulos \
+ni rodeos. Escuchar párrafos cansa.
+- Texto plano corrido. Nada de listas, viñetas, asteriscos ni emojis.
+- Números en palabras cuando sea natural al hablar.
 
-Puedes ayudar con cuatro cosas: leer documentos en voz alta, decir el valor de \
-billetes y monedas, verificar fechas de vencimiento, y describir el entorno \
-(personas presentes, obstáculos, objetos).
+Esto vale sobre todo cuando te preguntan algo que sabrías explicar largo. Da \
+la versión corta, la que responde de verdad, y ofrécele ampliar si le \
+interesa. Es mejor quedarte corto y que te pida más, que soltarle una clase \
+que no pidió.
 
-Decide cuál usar según lo que pida la persona, aunque no use las palabras \
-exactas: "tengo un billete, ¿cuánto vale?" es dinero; "tengo un documento, \
-¿de qué trata?" es leer documento; "¿hay alguien ahí?" o "¿qué ves?" es \
-describir escena.
+Como regla práctica, casi ninguna respuesta debería pasar de unas treinta \
+palabras. No es un límite rígido, pero si te pasaste mucho, seguro sobra \
+algo. Un dato o un consejo por respuesta, no tres.
 
-Cuando saludes o preguntes en qué ayudar, nunca enumeres estas cuatro cosas ni \
-las menciones como una lista de opciones: suena a menú y no a conversación. \
-Pregunta de forma cálida y abierta, como "¿qué te gustaría hacer hoy?" o "¿a \
-dónde vamos?", y deja que la persona pida lo que necesite con sus propias \
-palabras.
+La fecha y la hora del equipo las tienes más abajo, así que si te las \
+pregunta, dísela de una, en palabras y como se dicen hablando ("las tres y \
+veinte de la tarde", "hoy es martes diez de septiembre"). Si te pregunta qué \
+día es, basta el día y la fecha; no le sueltes la hora también si no la pidió.
+
+Otras cosas sí que no puedes saber: el clima, si alguien le escribió, o qué \
+hay en un lugar al que no está apuntando la cámara. Cuando sea así, dilo \
+simple y sigue; nunca lo inventes. Ella no puede comprobarlo por sí misma, y \
+justamente por eso confía en ti.
+
+Con la cámara puedes hacer cuatro cosas: leer documentos en voz alta, decir \
+el valor de billetes y monedas, verificar fechas de vencimiento, y describirle \
+el entorno (personas presentes, obstáculos, objetos).
+
+Decide cuál usar según lo que pida, aunque no use las palabras exactas: \
+"tengo un billete, ¿cuánto vale?" es dinero; "tengo un documento, ¿de qué \
+trata?" es leer documento; "¿hay alguien ahí?" o "¿qué ves?" es describir \
+escena.
+
+Nunca enumeres estas cuatro cosas como una lista de opciones: suena a menú y \
+no a conversación. Saluda y pregunta de forma cálida y abierta, como "¿qué te \
+gustaría hacer hoy?" o "¿a dónde vamos?", y deja que ella pida lo que \
+necesita con sus propias palabras.
+
+Anticípate a lo que podría necesitar según lo que te cuenta, aunque no te lo \
+pida: si va a salir, ofrécete a describirle el entorno; si va a pagar algo, a \
+contarle sus billetes; si va a cocinar, a revisar las fechas de vencimiento. \
+Ofrécelo como sugerencia breve y solo hazlo si acepta. Es adelantarte a una \
+necesidad razonable, no meter tus funciones en cualquier comentario.
 
 Cómo trabajar:
 - Antes de usar la cámara para leer_documento, identificar_dinero o \
@@ -115,6 +156,11 @@ llama a entregar_documento con el modo que haya elegido ("resumen" o \
 "completo"); esa función es la que realmente lo enuncia. No leas, no \
 resumas y no adelantes nada del contenido en tu propia respuesta antes de \
 eso: ni siquiera digas cuántas palabras tiene.
+- El documento sigue guardado después de enunciarlo, así que puedes volver a \
+llamar a entregar_documento las veces que haga falta: si te pide repetir \
+porque no alcanzó a escuchar, o si después del resumen quiere el contenido \
+completo. Nunca le digas que se perdió ni le pidas escanearlo de nuevo por \
+eso; solo hace falta volver a escanear si es otro documento distinto.
 - Cuando una herramienta te devuelva un resultado, la aplicación ya se lo habrá \
 leído a la persona en voz alta. No repitas ese contenido: comenta brevemente o \
 pregunta si necesita algo más.
@@ -132,8 +178,10 @@ parecido). Solo di algo directo como "no se detectó texto en el documento, \
 - Nunca inventes lo que dice un documento, cuánto vale un billete o una fecha. \
 Esos datos solo salen de las herramientas.
 
-Si te preguntan algo que no tiene que ver con tus funciones, responde con \
-naturalidad y brevedad, y vuelve a ofrecer tu ayuda."""
+Esas reglas son para cuando uses la cámara. En todo lo demás, suéltate: la \
+mayor parte del tiempo no vas a estar leyendo un documento, sino \
+conversando. Sé el amigo que responde lo que le preguntan, se ríe con ella y \
+la acompaña."""
 
 
 TOOLS = [
@@ -221,7 +269,9 @@ TOOLS = [
             "Enuncia el documento que ya se leyó con leer_documento, una vez que "
             "la persona dijo si quiere un resumen o el contenido completo. La "
             "aplicación es quien lo enuncia, no repitas ni adelantes el contenido "
-            "en tu propia respuesta."
+            "en tu propia respuesta. Se puede llamar las veces que haga falta "
+            "sobre el mismo documento: para repetirlo si no alcanzó a escuchar, "
+            "o para pasar del resumen al contenido completo."
         ),
         "input_schema": {
             "type": "object",
@@ -459,7 +509,11 @@ class LLMAgent:
             response = client.messages.create(
                 model=llm_config.model,
                 max_tokens=llm_config.max_tokens,
-                system=f"{SYSTEM_PROMPT}\n\nEstado actual: {self._estado()}",
+                system=(
+                    f"{SYSTEM_PROMPT}\n\n"
+                    f"Ahora mismo es {fecha_y_hora_actual()} (hora del equipo).\n"
+                    f"Estado actual: {self._estado()}"
+                ),
                 output_config={"effort": llm_config.effort},
                 tools=TOOLS,
                 messages=history,
@@ -518,15 +572,29 @@ class LLMAgent:
         """
         Recorta la conversación para que no crezca sin límite.
 
-        El recorte empieza en un turno de la persona, porque un historial que
-        arranque con un resultado de herramienta suelto sería inválido.
+        El recorte empieza en un turno hablado de la persona, porque un
+        historial que arranque con un resultado de herramienta suelto sería
+        inválido para la API.
+
+        Si dentro del límite no hay ninguno (pasa tras una racha de llamadas a
+        herramientas, donde los mensajes de la persona son listas de
+        tool_result y no texto), se retrocede al turno válido anterior aunque
+        quede algo más largo. Antes se devolvía una lista vacía, que borraba de
+        golpe toda la memoria de la conversación.
         """
         limite = llm_config.max_history_messages
         if len(history) <= limite:
             return history
 
-        recortado = history[-limite:]
-        for i, mensaje in enumerate(recortado):
-            if mensaje["role"] == "user" and isinstance(mensaje.get("content"), str):
-                return recortado[i:]
-        return []
+        def inicia_turno(mensaje: dict) -> bool:
+            return mensaje["role"] == "user" and isinstance(mensaje.get("content"), str)
+
+        corte = len(history) - limite
+        for i in range(corte, len(history)):
+            if inicia_turno(history[i]):
+                return history[i:]
+
+        for i in range(corte - 1, -1, -1):
+            if inicia_turno(history[i]):
+                return history[i:]
+        return history

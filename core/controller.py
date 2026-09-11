@@ -37,6 +37,10 @@ from app.core.llm_agent import LLMAgent
 
 State = Literal["IDLE", "TTS_SPEAKING", "LISTENING", "PROCESSING"]
 
+# El nombre se escribe "OJOZ" pero suena "ojos"; ver _normalize_tts_text.
+_OJOZ_HABLADO = re.compile(r"\bOJOZ\b", re.IGNORECASE)
+
+
 class Controller:
     """
     Orquestador de turnos TTS/STT con máquina de estados.
@@ -63,8 +67,10 @@ class Controller:
         # Para Opción 1 (OCR)
         self._pending_ocr_after_tts: bool = False
         self._ocr_capture_seconds: float | None = None
-        # Texto ya leido de un documento, esperando a que la persona diga si
-        # quiere un resumen o el contenido completo (ver entregar_documento).
+        # Texto del ultimo documento leido en esta sesion. Se conserva despues
+        # de enunciarlo para poder repetirlo o pasar del resumen al contenido
+        # completo sin volver a escanear (ver entregar_documento); se reemplaza
+        # al leer otro y se borra al cerrar sesion.
         self._pending_ocr_text: str | None = None
         # Para Opción 2 (Currency/Dinero)
         self._pending_currency_after_tts: bool = False
@@ -232,7 +238,11 @@ class Controller:
                     "No hay ningun documento leido esperando. Usa leer_documento "
                     "primero."
                 )
-            self._pending_ocr_text = None
+            # El texto se conserva: tras el resumen es normal que pida el
+            # contenido completo, o que pida repetir porque no alcanzo a
+            # escuchar. Borrarlo aqui obligaba a volver a escanear el mismo
+            # papel. Se reemplaza al leer otro documento y se borra al cerrar
+            # sesion.
             self.tts.join()
 
             modo = (modo or "").strip().lower()
@@ -271,6 +281,9 @@ class Controller:
             self._user_name = None
             self._authenticated = False
             self._conversation_state = None
+            # El documento leído no debe sobrevivir a la sesión: quien entre
+            # después no tiene por qué poder pedir que se lo lean.
+            self._pending_ocr_text = None
             # El historial se limpia al terminar el turno, no en mitad de él.
             self._llm_reset_pending = True
             self._end_session_camera()
@@ -554,6 +567,11 @@ class Controller:
     def _normalize_tts_text(self, text: str) -> str:
         if not text:
             return text
+
+        # El nombre se pronuncia "ojos". Escrito "OJOZ" la voz lo deletrea o
+        # marca la zeta final, que no es como suena de verdad. Esto solo toca
+        # lo que se manda a la voz: en el chat se sigue leyendo "OJOZ".
+        text = _OJOZ_HABLADO.sub("ojos", text)
 
         def _repl(match: re.Match[str]) -> str:
             value = int(match.group(0))

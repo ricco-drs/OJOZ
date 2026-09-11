@@ -69,6 +69,38 @@ class STTTests(unittest.TestCase):
         with patch.object(self.stt, "_probe_microphone_rms", side_effect=[0, 80]):
             self.assertEqual(self.stt._auto_select_microphone(), 6)
 
+    def test_warns_in_the_terminal_when_another_microphone_is_in_use(self):
+        # Sin este aviso, quien pidio el microfono del celular se queda
+        # hablandole al telefono mientras OJOZ escucha por la laptop. Va al
+        # terminal y nunca al chat: es diagnostico, no algo que OJOZ diga.
+        self.stt._device_name_requested = "iVCam"
+        self.stt._device_name_hint = "ivcam"
+        self.stt._mic_name = "Microphone Array (Realtek(R) Audio)"
+        with patch("app.audio.stt.logger.warning") as warning, \
+                patch("app.audio.stt.event_bus.publish") as publish:
+            self.stt._warn_if_not_the_requested_microphone()
+
+        publish.assert_not_called()
+        registrado = warning.call_args.args
+        self.assertIn("iVCam", registrado)
+        self.assertIn("Microphone Array (Realtek(R) Audio)", registrado)
+
+    def test_does_not_warn_when_the_requested_microphone_is_in_use(self):
+        self.stt._device_name_requested = "iVCam"
+        self.stt._device_name_hint = "ivcam"
+        self.stt._mic_name = "Micrófono (e2eSoft iVCam)"
+        with patch("app.audio.stt.logger.warning") as warning:
+            self.stt._warn_if_not_the_requested_microphone()
+        warning.assert_not_called()
+
+    def test_does_not_warn_when_no_microphone_was_requested(self):
+        self.stt._device_name_requested = ""
+        self.stt._device_name_hint = ""
+        self.stt._mic_name = "Microphone Array (Realtek(R) Audio)"
+        with patch("app.audio.stt.logger.warning") as warning:
+            self.stt._warn_if_not_the_requested_microphone()
+        warning.assert_not_called()
+
     def test_name_hint_prioritizes_without_excluding_other_mics(self):
         # El hint (OJOZ_MIC_NAME) es una preferencia de orden, no un filtro
         # exclusivo: si el dispositivo preferido no sirve (o el hint no

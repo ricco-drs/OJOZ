@@ -17,11 +17,13 @@ class TTSConfig:
     rate: int = 180
     volume: float = 1.0
     edge_voice: str = "es-MX-DaliaNeural"
-    # eleven_flash_v2_5 prioriza latencia baja a costa de naturalidad: acorta
-    # las pausas de puntuacion y suena apurado. eleven_multilingual_v2 tarda
-    # un poco mas en generarse pero respeta comas y puntos, con una entonacion
-    # mucho mas fluida.
-    elevenlabs_model: str = "eleven_multilingual_v2"
+    # eleven_v3_conversational es el modelo expresivo pensado para asistentes
+    # de voz: respeta comas, puntos y signos de interrogacion, y suena con
+    # emocion en vez de recitar. Ademas resulto mas rapido que el anterior
+    # (eleven_multilingual_v2), asi que el cambio no cuesta latencia.
+    # eleven_flash_v2_5 sigue siendo el mas rapido, pero suena apurado y se
+    # come las pausas de puntuacion.
+    elevenlabs_model: str = "eleven_v3_conversational"
     elevenlabs_timeout_seconds: float = 15.0
     # Ajustes de la voz: velocidad por debajo de 1.0 para un ritmo mas calmado,
     # y stability/similarity moderados para que suene expresiva sin volverse
@@ -153,7 +155,13 @@ class LLMConfig:
     timeout_seconds: float = 20.0   # antes que hacer esperar, se usa el respaldo
     max_retries: int = 1            # reintentar mucho añade silencios incómodos
     max_tool_iterations: int = 5    # tope de acciones encadenadas en un turno
-    max_history_messages: int = 24  # memoria de la conversación
+    # Memoria de la conversación. Se cuenta en mensajes de la API, no en
+    # turnos hablados: un turno con herramientas gasta hasta doce (el pedido,
+    # y cada llamada con su resultado), asi que con 24 OJOZ apenas recordaba
+    # un par de interacciones. Los mensajes son cortos —el texto de un
+    # documento nunca entra aqui, lo enuncia la aplicacion— asi que ampliar
+    # la ventana cuesta poco y permite recordar la sesion completa.
+    max_history_messages: int = 80
 
     # Si la API falla varias veces seguidas se hace una pausa y se atiende con el
     # enrutador, en lugar de reintentar en cada turno y demorar cada respuesta.

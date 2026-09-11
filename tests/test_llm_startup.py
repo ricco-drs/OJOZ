@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from app.config.settings import llm as llm_config
 from app.core.controller import Controller
-from app.core.llm_agent import LLMAgent
+from app.core.llm_agent import LLMAgent, fecha_y_hora_actual
 
 
 class ControllerStartupTests(unittest.TestCase):
@@ -137,6 +139,22 @@ class ControllerStartupTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         self.controller.tts.say.assert_called_once_with("Te escucho")
 
+    def test_the_name_is_spoken_as_ojos_but_written_as_ojoz(self):
+        # La voz debe decir "ojos"; el chat debe seguir mostrando la marca.
+        with patch("app.core.controller.event_bus.publish") as publish, \
+                patch.object(self.controller, "_schedule_fallback_rearm"):
+            Controller.speak(self.controller, "Hola, soy OJOZ, tu asistente.")
+
+        self.controller.tts.say.assert_called_once_with("Hola, soy ojos, tu asistente.")
+        escrito = [c for c in publish.call_args_list if c.kwargs.get("role") == "app/tts"]
+        self.assertEqual(escrito[0].kwargs["text"], "Hola, soy OJOZ, tu asistente.")
+
+    def test_the_name_is_replaced_in_any_casing_without_touching_other_words(self):
+        normalize = Controller._normalize_tts_text
+        self.assertEqual(normalize(self.controller, "Ojoz y ojoz"), "ojos y ojos")
+        # No debe morder palabras que solo lo contienen.
+        self.assertEqual(normalize(self.controller, "OJOZILLA"), "OJOZILLA")
+
 
 class AgentStartupTests(unittest.TestCase):
     def test_startup_passes_intro_as_internal_context_and_remembers_response(self):
@@ -159,6 +177,146 @@ class AgentStartupTests(unittest.TestCase):
                 patch.object(agent, "_get_client") as get_client:
             self.assertFalse(agent.is_available())
         get_client.assert_not_called()
+
+    def test_current_time_reaches_the_model_on_every_turn(self):
+        # Preguntar la hora es de lo mas comun, y el reloj del equipo ya la
+        # sabe: va en el contexto para responder sin una llamada extra.
+        agent = LLMAgent(actions={}, speak=Mock(), estado=lambda: "Sesion verificada")
+        response = SimpleNamespace(
+            stop_reason="end_turn", content=[SimpleNamespace(type="text", text="Son las tres")],
+        )
+        client = Mock()
+        client.messages.create.return_value = response
+        with patch.object(agent, "_get_client", return_value=client), \
+                patch("app.core.llm_agent.fecha_y_hora_actual", return_value="martes 10 de junio de 2025, 15:04"):
+            agent.handle("¿Qué hora es?")
+
+        system = client.messages.create.call_args.kwargs["system"]
+        self.assertIn("martes 10 de junio de 2025, 15:04", system)
+        self.assertIn("Sesion verificada", system)
+
+
+class EntregarDocumentoTests(unittest.TestCase):
+    """
+    Tras enunciar un documento hay que poder repetirlo.
+
+    OJOZ mismo ofrece "¿necesitas que te lea alguna parte completa?" despues
+    del resumen; si el texto se descartara al primer uso, esa oferta obligaria
+    a volver a escanear el mismo papel.
+    """
+
+    def setUp(self):
+        events = patch("app.core.controller.event_bus.publish")
+        events.start()
+        self.addCleanup(events.stop)
+        with patch.object(Controller, "_register_events"):
+            self.controller = Controller(tts=Mock(), stt=Mock())
+        self.addCleanup(self.controller.stop)
+        self.controller.speak = Mock()
+        self.controller._authenticated = True
+        self.controller._user_name = "Ricco"
+
+        acciones = self.controller._build_llm_actions()
+        self.entregar = acciones["entregar_documento"]
+        self.cerrar_sesion = acciones["cerrar_sesion"]
+        self.controller._pending_ocr_text = "Factura de luz, vence el 20 de junio."
+
+    def test_the_document_can_be_delivered_more_than_once(self):
+        with patch("app.core.controller.summarize_document_text", return_value="Es una factura."):
+            self.assertNotIn("No hay ningun documento", self.entregar("resumen"))
+        # Despues del resumen pide el contenido completo, y luego repetirlo.
+        self.assertNotIn("No hay ningun documento", self.entregar("completo"))
+        self.assertNotIn("No hay ningun documento", self.entregar("completo"))
+
+        hablado = " ".join(str(c.args[0]) for c in self.controller.speak.call_args_list)
+        self.assertIn("Factura de luz", hablado)
+
+    def test_reading_another_document_replaces_the_previous_one(self):
+        self.controller._pending_ocr_text = "Receta medica."
+        self.entregar("completo")
+        self.assertIn("Receta medica", str(self.controller.speak.call_args.args[0]))
+
+    def test_closing_the_session_forgets_the_document(self):
+        # Quien entre despues no tiene por que poder pedir que se lo lean.
+        self.cerrar_sesion()
+        self.assertIsNone(self.controller._pending_ocr_text)
+        self.assertIn("No hay ningun documento", self.entregar("completo"))
+
+
+class TrimHistoryTests(unittest.TestCase):
+    """El recorte del historial es lo unico que limita la memoria de OJOZ."""
+
+    def turno_hablado(self, texto: str) -> list[dict]:
+        return [
+            {"role": "user", "content": texto},
+            {"role": "assistant", "content": [{"type": "text"}]},
+        ]
+
+    def turno_con_herramientas(self, texto: str, llamadas: int = 5) -> list[dict]:
+        # La persona pide algo, el modelo encadena herramientas y responde.
+        return (
+            [{"role": "user", "content": texto}]
+            + [
+                {"role": "assistant", "content": [{"type": "tool_use"}]},
+                {"role": "user", "content": [{"type": "tool_result"}]},
+            ]
+            * llamadas
+            + [{"role": "assistant", "content": [{"type": "text"}]}]
+        )
+
+    def test_short_conversation_is_kept_whole(self):
+        historial = self.turno_hablado("hola") + self.turno_hablado("¿qué hora es?")
+        self.assertEqual(LLMAgent._trim(historial), historial)
+
+    def test_a_run_of_tool_calls_does_not_erase_the_memory(self):
+        # Antes esto devolvia [] y OJOZ olvidaba la conversacion entera: dentro
+        # del limite no habia ningun mensaje hablado, solo tool_result.
+        historial = [{"role": "user", "content": "lee el documento"}] + [
+            {"role": "assistant", "content": [{"type": "tool_use"}]},
+            {"role": "user", "content": [{"type": "tool_result"}]},
+        ] * 60
+
+        recortado = LLMAgent._trim(historial)
+
+        self.assertTrue(recortado, "se perdio toda la memoria de la conversacion")
+        self.assertEqual(recortado[0], {"role": "user", "content": "lee el documento"})
+
+    def test_trimmed_history_always_starts_on_a_spoken_turn(self):
+        # Un historial que empiece con un tool_result suelto es invalido para
+        # la API: el tool_use que lo justifica quedaria fuera.
+        historial = []
+        for i in range(30):
+            historial += self.turno_con_herramientas(f"pedido {i}")
+
+        recortado = LLMAgent._trim(historial)
+
+        self.assertEqual(recortado[0]["role"], "user")
+        self.assertIsInstance(recortado[0]["content"], str)
+
+    def test_recent_exchanges_survive_the_trim(self):
+        historial = []
+        for i in range(60):
+            historial += self.turno_hablado(f"mensaje {i}")
+
+        recortado = LLMAgent._trim(historial)
+
+        self.assertLessEqual(len(recortado), llm_config.max_history_messages)
+        self.assertEqual(recortado[-2], {"role": "user", "content": "mensaje 59"})
+
+
+class FechaYHoraTests(unittest.TestCase):
+    def test_names_are_spanish_regardless_of_system_locale(self):
+        # strftime devolveria "Tuesday" o "martes" segun el idioma de Windows.
+        self.assertEqual(
+            fecha_y_hora_actual(datetime(2025, 6, 10, 15, 4)),
+            "martes 10 de junio de 2025, 15:04",
+        )
+
+    def test_midnight_and_new_year_are_formatted_as_spoken(self):
+        self.assertEqual(
+            fecha_y_hora_actual(datetime(2026, 1, 1, 0, 0)),
+            "jueves 1 de enero de 2026, 00:00",
+        )
 
 
 if __name__ == "__main__":

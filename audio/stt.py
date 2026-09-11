@@ -76,7 +76,8 @@ class STT:
         # Seleccion de micro
         self._mic_name = "desconocido"
         self._device_index = stt_config.device_index
-        self._device_name_hint = (getattr(stt_config, "device_name_hint", None) or "").casefold().strip()
+        self._device_name_requested = (getattr(stt_config, "device_name_hint", None) or "").strip()
+        self._device_name_hint = self._device_name_requested.casefold()
         self._configured_device_index = stt_config.device_index
         if self._device_index is None:
             self._device_index = self._auto_select_microphone()
@@ -438,6 +439,7 @@ class STT:
                     msg = f"Micrófono calibrado: idx={self._device_index}, nombre='{self._mic_name}'."
                     event_bus.publish("ui:print", role="sys", text=msg)
                     self._log_selected_microphone(prefix="Microfono calibrado")
+                    self._warn_if_not_the_requested_microphone()
                     return
                 except Exception as e:
                     last_err = e
@@ -463,6 +465,28 @@ class STT:
             event_bus.publish("ui:print", role="sys",
                               text=f"No se pudo calibrar el micrófono ({err_text}). Verifica permisos y dispositivo.")
             logger.warning(f"STT calibration failed: {e}")
+
+    def _warn_if_not_the_requested_microphone(self) -> None:
+        """
+        Deja constancia de que se escucha por un microfono distinto al pedido.
+
+        Con OJOZ_MIC_NAME apuntando al celular (iVCam), es facil quedarse
+        hablandole al telefono sin enterarse de que OJOZ esta oyendo por la
+        laptop, porque el cambio ocurre solo cuando el pedido no entrega señal.
+
+        Va al terminal y no al chat a proposito: es un dato de diagnostico para
+        quien monta la demo, no algo que OJOZ deba decirle a la persona.
+        """
+        if not self._device_name_hint:
+            return
+        if self._device_name_hint in (self._mic_name or "").casefold():
+            return
+        logger.warning(
+            "El microfono pedido (%s) no entrega audio; se escucha por '%s'. "
+            "Revisa que este conectado y con el microfono activado.",
+            self._device_name_requested,
+            self._mic_name,
+        )
 
     def _apply_energy_boost(self, ambient_rms: float | None = None) -> None:
         """
